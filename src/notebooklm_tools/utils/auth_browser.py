@@ -131,7 +131,9 @@ def _get_saved_browser_backend(profile_name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def run_headless_auth(profile_name: str = "default", timeout: int = 30) -> Any | None:
+def run_headless_auth(
+    profile_name: str = "default", timeout: int = 30, port: int = 9223
+) -> Any | None:
     """Try headless auth using the profile's saved backend, then reasonable fallbacks."""
     preferred_backend = _get_saved_browser_backend(profile_name)
     attempts: list[str] = []
@@ -150,7 +152,11 @@ def run_headless_auth(profile_name: str = "default", timeout: int = 30) -> Any |
         if backend == "chromium_cdp":
             from notebooklm_tools.utils.cdp import run_headless_auth as run_headless_chromium_auth
 
-            tokens = run_headless_chromium_auth(timeout=timeout, profile_name=profile_name)
+            tokens = run_headless_chromium_auth(
+                port=port,
+                timeout=timeout,
+                profile_name=profile_name,
+            )
             if tokens:
                 return tokens
             continue

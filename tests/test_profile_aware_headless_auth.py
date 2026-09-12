@@ -3,6 +3,30 @@
 from types import SimpleNamespace
 
 
+def test_auth_browser_headless_dispatcher_forwards_requested_cdp_port(monkeypatch):
+    """The backend dispatcher must preserve the broker's dedicated CDP port."""
+    import notebooklm_tools.utils.auth_browser as auth_browser
+
+    calls: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(auth_browser, "_get_saved_browser_backend", lambda _profile: "chromium_cdp")
+    monkeypatch.setattr(
+        auth_browser,
+        "select_auth_backend",
+        lambda: {"backend": "chromium_cdp", "browser": "Google Chrome"},
+    )
+    monkeypatch.setattr(
+        "notebooklm_tools.utils.cdp.run_headless_auth",
+        lambda *, port, timeout, profile_name: calls.append((port, timeout, profile_name))
+        or object(),
+        raising=True,
+    )
+
+    result = auth_browser.run_headless_auth(profile_name="pte", timeout=45, port=9224)
+
+    assert result is not None
+    assert calls == [(9224, 45, "pte")]
+
+
 def test_mcp_refresh_auth_uses_configured_default_profile(monkeypatch):
     """refresh_auth() must run headless auth against the configured default profile."""
     import notebooklm_tools.mcp.tools.auth as auth_tools

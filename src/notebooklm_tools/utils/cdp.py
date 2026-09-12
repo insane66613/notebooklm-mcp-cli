@@ -1630,6 +1630,28 @@ def _terminate_profile_browsers(profile_name: str, profile_dir: Path) -> None:
         _kill_process(process_id)
 
 
+def cleanup_orphaned_profile_browsers(profile_name: str = "default") -> bool:
+    """Terminate stale managed-profile browsers only when no usable CDP listener survives."""
+    existing_port, debugger_url = find_existing_nlm_chrome(
+        profile_name=profile_name,
+        include_headless=True,
+    )
+    if existing_port is not None and debugger_url:
+        return False
+
+    chrome_path = get_chrome_path()
+    profile_dir = (
+        _get_profile_dir_for_launch(chrome_path, profile_name)
+        if chrome_path
+        else get_chrome_profile_dir(profile_name)
+    )
+    if not _find_profile_browser_pids(profile_name, profile_dir):
+        return False
+
+    _terminate_profile_browsers(profile_name, profile_dir)
+    return True
+
+
 def _clear_profile_directory(profile_name: str, profile_dir: Path) -> None:
     """Stop profile-owned browsers, then remove the managed profile directory."""
     _terminate_profile_browsers(profile_name, profile_dir)
@@ -2165,7 +2187,10 @@ def run_headless_auth(
         return None
 
     finally:
-        # IMPORTANT: Only terminate Chrome if we launched it
-        # Don't terminate if we connected to existing Chrome instance
+        # IMPORTANT: Only terminate Chrome if we launched it.
+        # If Windows handed the launch off to an orphaned managed-profile
+        # browser, the launcher handle can exit while that stale tree survives.
+        # Clean that tree only after proving the profile has no usable CDP listener.
         if chrome_process and not chrome_was_running:
             terminate_chrome(chrome_process, port)
+            cleanup_orphaned_profile_browsers(profile_name)

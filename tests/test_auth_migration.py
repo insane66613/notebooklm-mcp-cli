@@ -229,6 +229,73 @@ class TestBrowserDetection:
 class TestCDPStartupHandling:
     """Tests for CDP startup timing and diagnostics."""
 
+    def test_failed_headless_launch_cleans_profile_owned_orphans(self, monkeypatch):
+        """A failed headless bind must clean only the managed profile it launched for."""
+        from notebooklm_tools.utils import cdp
+
+        class FakeProcess:
+            pass
+
+        cleanup_calls: list[str] = []
+        monkeypatch.setattr(cdp, "has_chrome_profile", lambda _profile: True)
+        monkeypatch.setattr(cdp, "find_existing_nlm_chrome", lambda **_kwargs: (None, None))
+        monkeypatch.setattr(cdp, "launch_chrome_process", lambda *_args, **_kwargs: FakeProcess())
+        monkeypatch.setattr(cdp, "get_debugger_url", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(cdp, "terminate_chrome", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            cdp,
+            "cleanup_orphaned_profile_browsers",
+            lambda profile_name: cleanup_calls.append(profile_name) or True,
+            raising=False,
+        )
+
+        result = cdp.run_headless_auth(port=9224, timeout=1, profile_name="pte")
+
+        assert result is None
+        assert cleanup_calls == ["pte"]
+
+    def test_orphan_cleanup_terminates_managed_profile_without_live_cdp(
+        self, monkeypatch, tmp_path
+    ):
+        """Cleanup may terminate only when no usable CDP listener survives for that profile."""
+        from notebooklm_tools.utils import cdp
+
+        profile_dir = tmp_path / "pte"
+        calls: list[tuple[str, Path]] = []
+        monkeypatch.setattr(cdp, "find_existing_nlm_chrome", lambda **_kwargs: (None, None))
+        monkeypatch.setattr(cdp, "get_chrome_path", lambda: "chrome")
+        monkeypatch.setattr(
+            cdp,
+            "_get_profile_dir_for_launch",
+            lambda _browser, _profile: profile_dir,
+        )
+        monkeypatch.setattr(cdp, "_find_profile_browser_pids", lambda *_args: [101])
+        monkeypatch.setattr(
+            cdp,
+            "_terminate_profile_browsers",
+            lambda profile_name, resolved_dir: calls.append((profile_name, resolved_dir)),
+        )
+
+        assert cdp.cleanup_orphaned_profile_browsers("pte") is True
+        assert calls == [("pte", profile_dir)]
+
+    def test_orphan_cleanup_refuses_to_kill_profile_with_live_cdp(self, monkeypatch):
+        """Cleanup must fail closed when the managed profile still owns a usable CDP listener."""
+        from notebooklm_tools.utils import cdp
+
+        monkeypatch.setattr(
+            cdp,
+            "find_existing_nlm_chrome",
+            lambda **_kwargs: (9223, "ws://127.0.0.1:9223/devtools/browser/live"),
+        )
+        monkeypatch.setattr(
+            cdp,
+            "_terminate_profile_browsers",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live profile must not be killed")),
+        )
+
+        assert cdp.cleanup_orphaned_profile_browsers("pte") is False
+
     def test_get_debugger_url_uses_ipv4_loopback(self):
         """CDP version probe should use 127.0.0.1 consistently."""
         from notebooklm_tools.utils.cdp import get_debugger_url
