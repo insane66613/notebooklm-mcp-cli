@@ -16,8 +16,9 @@ def test_auth_browser_headless_dispatcher_forwards_requested_cdp_port(monkeypatc
     )
     monkeypatch.setattr(
         "notebooklm_tools.utils.cdp.run_headless_auth",
-        lambda *, port, timeout, profile_name: calls.append((port, timeout, profile_name))
-        or object(),
+        lambda *, port, timeout, profile_name: (
+            calls.append((port, timeout, profile_name)) or object()
+        ),
         raising=True,
     )
 

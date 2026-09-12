@@ -291,7 +291,9 @@ class TestCDPStartupHandling:
         monkeypatch.setattr(
             cdp,
             "_terminate_profile_browsers",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live profile must not be killed")),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("live profile must not be killed")
+            ),
         )
 
         assert cdp.cleanup_orphaned_profile_browsers("pte") is False

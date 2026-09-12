@@ -78,7 +78,8 @@ def refresh_auth() -> ResultDict:
             status, detail = stale_cached
             return error_result(
                 "Cached auth is no longer valid and the saved browser profile "
-                "could not refresh it automatically.",
+                "could not refresh it automatically. Run `nlm login` in a terminal "
+                "to re-authenticate.",
                 status="expired",
                 reason=status,
                 details=detail,
