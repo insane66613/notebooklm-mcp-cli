@@ -1092,11 +1092,12 @@ def auth_refresh(
     profile_name = profile or get_config().auth.default_profile
     if http_only:
         from notebooklm_tools.services.auth_http import refresh_auth_http_only
+        from notebooklm_tools.services.errors import ServiceError
 
         with console.status(f"Checking browserless refresh for '{profile_name}'..."):
             try:
                 refresh_auth_http_only(profile_name)
-            except Exception as exc:
+            except ServiceError as exc:
                 console.print(f"[red]✗[/red] HTTP-only refresh failed: {exc}")
                 raise typer.Exit(1) from exc
         console.print(f"[green]✓[/green] HTTP-only session refresh validated for '{profile_name}'.")

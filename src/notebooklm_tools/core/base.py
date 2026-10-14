@@ -454,6 +454,7 @@ class BaseClient:
         project_id: str | None = None,
         auth_revision: str | None = None,
         is_env_auth: bool | None = None,
+        rpc_transport: str | None = None,
     ):
         """
         Initialize the base client.
@@ -482,6 +483,7 @@ class BaseClient:
         self._base_host = base_host
         self._profile_name = profile_name
         self._auth_revision = auth_revision
+        self._rpc_transport = rpc_transport
         if is_env_auth is None:
             self._is_env_auth = bool(os.environ.get("NOTEBOOKLM_COOKIES") and profile_name is None)
         else:
@@ -866,6 +868,8 @@ class BaseClient:
         return present
 
     def _cdp_rpc_transport_enabled(self) -> bool:
+        if getattr(self, "_rpc_transport", None) is not None:
+            return self._rpc_transport == "cdp"
         from .cdp_transport import cdp_transport_enabled
 
         return cdp_transport_enabled()

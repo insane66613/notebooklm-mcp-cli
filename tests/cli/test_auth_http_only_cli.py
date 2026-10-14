@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from notebooklm_tools.cli.main import app
 from notebooklm_tools.services import auth_http
+from notebooklm_tools.services.errors import ServiceError
 
 
 def test_http_only_invokes_http_refresh_not_browser(monkeypatch):
@@ -29,7 +30,7 @@ def test_http_only_failure_exits_nonzero(monkeypatch):
     monkeypatch.setattr(
         auth_http,
         "refresh_auth_http_only",
-        Mock(side_effect=ValueError("stale Google login")),
+        Mock(side_effect=ServiceError("stale Google login")),
     )
     result = CliRunner().invoke(app, ["auth", "refresh", "--http-only", "--profile", "secondary"])
     assert result.exit_code == 1
