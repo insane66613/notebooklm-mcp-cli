@@ -1,7 +1,8 @@
 """Bound automatic headless authentication attempts per saved profile.
 
 Only automatic RPC recovery uses this budget. Explicit CLI/MCP refresh remains
-available to callers, and a changed credential revision resets the budget.
+available to callers. A changed credential revision (or file-mode cookie
+fingerprint) resets the budget.
 """
 
 from __future__ import annotations

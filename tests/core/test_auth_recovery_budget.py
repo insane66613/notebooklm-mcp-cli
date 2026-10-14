@@ -170,3 +170,39 @@ def test_exception_releases_waiters_and_counts_failure(monkeypatch):
         budget.run_automatic_recovery("work", "v1", fail)
     assert budget._budgets["work"].failures == 1
     assert "work" not in budget._inflight
+
+
+def test_file_mode_cookie_change_resets_failure_budget(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    from notebooklm_tools.core.base import BaseClient
+
+    budget._budgets.clear()
+    budget._inflight.clear()
+    monkeypatch.delenv("NOTEBOOKLM_DISABLE_HEADLESS_REFRESH", raising=False)
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_RECOVERY_COOLDOWN_SECONDS", "0")
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_MAX_HEADLESS_FAILURES", "1")
+    cached = SimpleNamespace(cookies={"SID": "synthetic-old"}, revision=None)
+    monkeypatch.setattr("notebooklm_tools.core.auth.load_cached_tokens", lambda **_: cached)
+    calls = []
+
+    def recover(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr("notebooklm_tools.utils.auth_browser.run_headless_auth", recover)
+    obj = BaseClient.__new__(BaseClient)
+    obj._is_env_auth = False
+    obj._profile_name = "file-profile"
+    obj._auth_revision = None
+    obj.cookies = cached.cookies
+    obj._state_lock = threading.Lock()
+    assert not obj._try_reload_or_headless_auth()
+    assert not obj._try_reload_or_headless_auth()
+    assert len(calls) == 1
+    cached.cookies = {"SID": "synthetic-new"}
+    obj.cookies = cached.cookies  # A client initialized after an external login.
+    assert not obj._try_reload_or_headless_auth()
+    assert len(calls) == 2
+    assert calls[-1]["expected_revision"] is None

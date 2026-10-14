@@ -9,6 +9,7 @@ Internal API. See CLAUDE.md for full documentation.
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1492,7 +1493,15 @@ class BaseClient:
                 logger.debug(f"Headless auth failed: {e}")
                 return None
 
-        tokens = run_automatic_recovery(profile_name, starting_rev, recover)
+        budget_revision = starting_rev
+        if budget_revision is None:
+            # File-mode profiles have no envelope revision. A cookie change
+            # from an external login must still reset the recovery budget.
+            cookie_snapshot = cached.cookies if cached else self.cookies
+            budget_revision = hashlib.sha256(
+                json.dumps(cookie_snapshot, sort_keys=True).encode()
+            ).hexdigest()
+        tokens = run_automatic_recovery(profile_name, budget_revision, recover)
         if not tokens:
             logger.info("Automatic headless auth failed or deferred by per-profile recovery budget")
             return False
