@@ -2146,7 +2146,6 @@ def _run_headless_auth_unlocked(
             terminate_chrome(chrome_process, port)
 
 
-
 def run_headless_auth(
     port: int = 9223,
     timeout: int = 30,
@@ -2179,15 +2178,9 @@ def run_headless_auth(
     try:
         with lock:
             updated = load_cached_tokens(profile_name=profile_name)
-            revision_changed = (
-                updated is not None
-                and (
-                    (before_revision is not None and updated.revision != before_revision)
-                    or (
-                        before_revision is None
-                        and (updated.extracted_at or 0) > before_extracted
-                    )
-                )
+            revision_changed = updated is not None and (
+                (before_revision is not None and updated.revision != before_revision)
+                or (before_revision is None and (updated.extracted_at or 0) > before_extracted)
             )
             if (
                 not force

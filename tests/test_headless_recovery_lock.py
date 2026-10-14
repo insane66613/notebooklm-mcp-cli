@@ -1,4 +1,5 @@
 """Cross-process-safe headless recovery does not relaunch a second browser."""
+
 from __future__ import annotations
 
 import multiprocessing
@@ -61,8 +62,12 @@ def test_two_threads_share_one_profile_recovery(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cdp, "_run_headless_auth_unlocked", launch)
     results = []
-    worker1 = threading.Thread(target=lambda: results.append(cdp.run_headless_auth(profile_name="work")))
-    worker2 = threading.Thread(target=lambda: results.append(cdp.run_headless_auth(profile_name="work")))
+    worker1 = threading.Thread(
+        target=lambda: results.append(cdp.run_headless_auth(profile_name="work"))
+    )
+    worker2 = threading.Thread(
+        target=lambda: results.append(cdp.run_headless_auth(profile_name="work"))
+    )
     worker1.start()
     assert enter.wait(5)
     worker2.start()
@@ -86,7 +91,6 @@ def test_recovery_locks_distinct_profiles_independently(tmp_path, monkeypatch):
     assert cdp.run_headless_auth(profile_name="a") is True
     assert cdp.run_headless_auth(profile_name="b") is True
     assert calls == ["a", "b"]
-
 
 
 def _hold_recovery_lock(lock_path: str, started, release):
