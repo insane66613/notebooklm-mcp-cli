@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -19,8 +21,17 @@ class _Budget:
     failures: int = 0
 
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _budgets: dict[str, _Budget] = {}
+
+
+@dataclass
+class _Attempt:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+
+
+_inflight: dict[str, _Attempt] = {}
 
 
 def _config_number(name: str, fallback: int) -> int:
@@ -55,3 +66,33 @@ def finish_automatic_recovery(profile: str, success: bool) -> None:
         if budget is None:
             return
         budget.failures = 0 if success else budget.failures + 1
+
+
+def run_automatic_recovery(
+    profile: str,
+    revision: str | None,
+    recover: Callable[[], Any],
+    *,
+    wait_timeout: float = 60,
+) -> Any:
+    """Share an in-flight attempt before applying limits to a new attempt."""
+    with _lock:
+        attempt = _inflight.get(profile)
+        owner = attempt is None
+        if owner:
+            if not allow_automatic_recovery(profile, revision):
+                return None
+            attempt = _Attempt()
+            _inflight[profile] = attempt
+    assert attempt is not None
+    if not owner:
+        return attempt.result if attempt.done.wait(wait_timeout) else None
+
+    try:
+        attempt.result = recover()
+        return attempt.result
+    finally:
+        with _lock:
+            finish_automatic_recovery(profile, bool(attempt.result))
+            del _inflight[profile]
+            attempt.done.set()

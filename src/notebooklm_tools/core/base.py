@@ -1465,48 +1465,40 @@ class BaseClient:
             return False
         from notebooklm_tools.utils.config import get_config
 
-        from .auth_recovery_budget import allow_automatic_recovery, finish_automatic_recovery
+        from .auth_recovery_budget import run_automatic_recovery
 
         profile_name = self._profile_name or get_config().auth.default_profile
-        if not allow_automatic_recovery(profile_name, starting_rev):
-            logger.info("Automatic headless auth deferred by per-profile recovery budget")
+
+        def recover():
+            try:
+                from notebooklm_tools.utils.auth_browser import run_headless_auth
+
+                return run_headless_auth(
+                    profile_name=profile_name,
+                    expected_revision=starting_rev,
+                    force=False,
+                )
+            except StaleRevisionError:
+                # Keep credentials saved by a concurrent external login.
+                logger.info(
+                    "Disk credentials changed during headless auth; keeping disk credentials."
+                )
+                return load_cached_tokens(profile_name=profile_name)
+            except Exception as e:
+                logger.debug(f"Headless auth failed: {e}")
+                return None
+
+        tokens = run_automatic_recovery(profile_name, starting_rev, recover)
+        if not tokens:
+            logger.info("Automatic headless auth failed or deferred by per-profile recovery budget")
             return False
-        recovered = False
-        try:
-            from notebooklm_tools.utils.auth_browser import run_headless_auth
-
-            tokens = run_headless_auth(
-                profile_name=profile_name,
-                expected_revision=starting_rev,
-                force=False,
-            )
-            if tokens:
-                with self._state_lock:
-                    self.cookies = tokens.cookies
-                    self.csrf_token = tokens.csrf_token
-                    self._session_id = tokens.session_id
-                    self._auth_revision = getattr(tokens, "revision", None)
-                recovered = True
-                return True
-        except StaleRevisionError:
-            # Disk changed while browser ran; keep disk login and drop browser result
-            logger.info("Disk credentials changed during headless auth; keeping disk credentials.")
-            reloaded = load_cached_tokens(profile_name=self._profile_name)
-            if reloaded:
-                with self._state_lock:
-                    self.cookies = reloaded.cookies
-                    self.csrf_token = reloaded.csrf_token
-                    self._session_id = reloaded.session_id
-                    if reloaded.build_label:
-                        self._bl = reloaded.build_label
-                    if reloaded.base_host:
-                        self._base_host = reloaded.base_host
-                    self._auth_revision = reloaded.revision
-                recovered = True
-                return True
-        except Exception as e:
-            logger.debug(f"Headless auth failed: {e}")
-        finally:
-            finish_automatic_recovery(profile_name, recovered)
-
-        return False
+        with self._state_lock:
+            self.cookies = tokens.cookies
+            self.csrf_token = tokens.csrf_token
+            self._session_id = tokens.session_id
+            if tokens.build_label:
+                self._bl = tokens.build_label
+            if tokens.base_host:
+                self._base_host = tokens.base_host
+            self._auth_revision = getattr(tokens, "revision", None)
+        return True
