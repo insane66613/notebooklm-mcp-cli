@@ -1463,11 +1463,18 @@ class BaseClient:
         if os.environ.get("NOTEBOOKLM_DISABLE_HEADLESS_REFRESH") == "1":
             logger.debug("Headless refresh disabled via NOTEBOOKLM_DISABLE_HEADLESS_REFRESH")
             return False
+        from notebooklm_tools.utils.config import get_config
+
+        from .auth_recovery_budget import allow_automatic_recovery, finish_automatic_recovery
+
+        profile_name = self._profile_name or get_config().auth.default_profile
+        if not allow_automatic_recovery(profile_name, starting_rev):
+            logger.info("Automatic headless auth deferred by per-profile recovery budget")
+            return False
+        recovered = False
         try:
             from notebooklm_tools.utils.auth_browser import run_headless_auth
-            from notebooklm_tools.utils.config import get_config
 
-            profile_name = self._profile_name or get_config().auth.default_profile
             tokens = run_headless_auth(
                 profile_name=profile_name,
                 expected_revision=starting_rev,
@@ -1479,6 +1486,7 @@ class BaseClient:
                     self.csrf_token = tokens.csrf_token
                     self._session_id = tokens.session_id
                     self._auth_revision = getattr(tokens, "revision", None)
+                recovered = True
                 return True
         except StaleRevisionError:
             # Disk changed while browser ran; keep disk login and drop browser result
@@ -1494,8 +1502,11 @@ class BaseClient:
                     if reloaded.base_host:
                         self._base_host = reloaded.base_host
                     self._auth_revision = reloaded.revision
+                recovered = True
                 return True
         except Exception as e:
             logger.debug(f"Headless auth failed: {e}")
+        finally:
+            finish_automatic_recovery(profile_name, recovered)
 
         return False
