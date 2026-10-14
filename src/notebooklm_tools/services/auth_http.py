@@ -3,6 +3,7 @@
 This does not renew Google's browser-dependent PSIDTS family and is not a
 substitute for interactive login. No browser process is launched.
 """
+
 from __future__ import annotations
 
 import time

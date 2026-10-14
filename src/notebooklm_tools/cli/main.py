@@ -1099,9 +1099,7 @@ def auth_refresh(
             except Exception as exc:
                 console.print(f"[red]✗[/red] HTTP-only refresh failed: {exc}")
                 raise typer.Exit(1) from exc
-        console.print(
-            f"[green]✓[/green] HTTP-only session refresh validated for '{profile_name}'."
-        )
+        console.print(f"[green]✓[/green] HTTP-only session refresh validated for '{profile_name}'.")
         return
 
     from notebooklm_tools.utils.auth_browser import run_headless_auth

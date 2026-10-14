@@ -1,4 +1,5 @@
 """HTTP-only refresh never launches a browser and never persists unvalidated cookies."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -11,8 +12,12 @@ from notebooklm_tools.services import auth_http
 
 def _cached():
     return SimpleNamespace(
-        cookies={"SID": "old"}, csrf_token="old", session_id="old-sid",
-        build_label="old-bl", base_host="notebooklm.google.com", revision=None,
+        cookies={"SID": "old"},
+        csrf_token="old",
+        session_id="old-sid",
+        build_label="old-bl",
+        base_host="notebooklm.google.com",
+        revision=None,
     )
 
 

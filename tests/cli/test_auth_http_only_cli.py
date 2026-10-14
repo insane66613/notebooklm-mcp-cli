@@ -1,4 +1,5 @@
 """CLI HTTP-only mode invokes no browser and respects the selected profile."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
