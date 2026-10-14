@@ -377,9 +377,15 @@ also refresh proactively from a scheduler so a session never lapses:
 ```bash
 nlm auth refresh                     # Headless, no interaction; exits non-zero on failure
 nlm auth refresh --profile work      # Refresh a named profile
+nlm auth refresh --http-only         # Validate without opening a browser
 ```
 
-Run it on a timer (cron/launchd). It needs a saved Chrome profile from a prior
+`--http-only` forces HTTP transport, including when CDP transport is configured.
+It cannot renew browser-dependent PSIDTS cookies or revive a fully expired login.
+Automatic recovery uses a per-process cooldown and failure budget; explicit
+refresh commands bypass these limits. See [authentication guidance](docs/AUTHENTICATION.md#automatic-recovery).
+
+Run browser-based refresh on a timer (cron/launchd). It needs a saved Chrome profile from a prior
 `nlm login`, and does not apply when `NOTEBOOKLM_COOKIES` is set as an
 environment variable (that value overrides saved credentials).
 

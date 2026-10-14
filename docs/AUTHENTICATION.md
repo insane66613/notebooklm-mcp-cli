@@ -157,7 +157,7 @@ This means you can stay logged into multiple Google accounts simultaneously with
 
 ---
 
-## Unattended / Scheduled Refresh
+## Automatic Recovery
 
 Automatic browser recovery is limited per profile within each process:
 `NOTEBOOKLM_AUTH_RECOVERY_COOLDOWN_SECONDS` defaults to 900 seconds and
@@ -167,6 +167,8 @@ resets the budget; success clears its failure count. Concurrent requests share
 an active recovery and wait up to 60 seconds for its result instead of consuming
 another attempt. Explicit CLI and MCP refresh commands bypass this budget.
 These limits are not a durable policy across separate processes.
+
+## Unattended / Scheduled Refresh
 
 A logged-in session normally self-heals: when the short-lived cookies age out,
 the client automatically runs a headless-browser pass to make Google reissue
