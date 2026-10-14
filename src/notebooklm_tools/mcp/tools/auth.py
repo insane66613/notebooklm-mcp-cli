@@ -28,6 +28,7 @@ def refresh_auth(profile: str | None = None) -> ResultDict:
 
     Returns status indicating if tokens were refreshed successfully.
     """
+
     def reload_active_client() -> None:
         from notebooklm_tools.utils.config import get_config
 

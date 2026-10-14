@@ -1,4 +1,5 @@
 """Explicit MCP auth refresh must not switch or replace another account."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -13,11 +14,15 @@ def test_explicit_profile_refresh_isolated_from_active_client(monkeypatch):
     observed = []
     monkeypatch.delenv("NOTEBOOKLM_COOKIES", raising=False)
     monkeypatch.setattr(
-        auth_service, "load_cached_tokens",
-        lambda **kwargs: observed.append(("load", kwargs)) or SimpleNamespace(cookies={"SID": "old"}),
+        auth_service,
+        "load_cached_tokens",
+        lambda **kwargs: (
+            observed.append(("load", kwargs)) or SimpleNamespace(cookies={"SID": "old"})
+        ),
     )
     monkeypatch.setattr(
-        auth_service, "credentials_are_usable",
+        auth_service,
+        "credentials_are_usable",
         lambda **kwargs: observed.append(("check", kwargs)) or (True, "configured", None),
     )
     reset = Mock()
