@@ -1,4 +1,5 @@
 """Bound repeated automatic browser recovery without blocking explicit refresh."""
+
 from __future__ import annotations
 
 from notebooklm_tools.core import auth_recovery_budget as budget

@@ -3,6 +3,7 @@
 Only automatic RPC recovery uses this budget. Explicit CLI/MCP refresh remains
 available to callers, and a changed credential revision resets the budget.
 """
+
 from __future__ import annotations
 
 import os
