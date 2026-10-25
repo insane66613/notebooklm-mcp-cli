@@ -1,15 +1,23 @@
 """Server tools - Server info and version checking."""
 
 import json
+import threading
+import time
 import urllib.request
 from typing import Any, cast
 
 from notebooklm_tools import __version__
+from notebooklm_tools.utils.versioning import is_newer_version
 
 from ._utils import logged_tool
 
+_VERSION_CACHE_TTL_SECONDS = 86400
+_VERSION_FAILURE_CACHE_TTL_SECONDS = 300
+_version_cache_lock = threading.Lock()
+_version_cache: tuple[float, str | None] | None = None
 
-def _get_latest_pypi_version() -> str | None:
+
+def _fetch_latest_pypi_version() -> str | None:
     """Fetch the latest version from PyPI.
 
     Returns:
@@ -30,19 +38,40 @@ def _get_latest_pypi_version() -> str | None:
     return None
 
 
-def _compare_versions(current: str, latest: str) -> bool:
-    """Compare version strings to determine if an update is available.
+def _get_latest_pypi_version() -> str | None:
+    """Return the latest PyPI version with bounded process-local caching.
 
-    Returns:
-        True if latest is greater than current.
+    Successful lookups are reused for 24 hours. Failed lookups are cached for
+    five minutes so an offline long-lived MCP server does not pay the two-second
+    network timeout on every server_info() call.
     """
-    try:
-        # Simple comparison: split by dots and compare numerically
-        current_parts = [int(x) for x in current.split(".")]
-        latest_parts = [int(x) for x in latest.split(".")]
-        return latest_parts > current_parts
-    except (ValueError, AttributeError):
-        return False
+    global _version_cache
+
+    def _cached_value(now: float) -> tuple[bool, str | None]:
+        cached = _version_cache
+        if cached is None:
+            return False, None
+        checked_at, latest = cached
+        ttl = (
+            _VERSION_CACHE_TTL_SECONDS if latest is not None else _VERSION_FAILURE_CACHE_TTL_SECONDS
+        )
+        if now - checked_at < ttl:
+            return True, latest
+        return False, None
+
+    now = time.monotonic()
+    fresh, latest = _cached_value(now)
+    if fresh:
+        return latest
+
+    with _version_cache_lock:
+        now = time.monotonic()
+        fresh, latest = _cached_value(now)
+        if fresh:
+            return latest
+        latest = _fetch_latest_pypi_version()
+        _version_cache = (now, latest)
+        return latest
 
 
 def _check_auth_status() -> str:
@@ -109,6 +138,49 @@ def _runtime_capabilities(
     }
 
 
+def _check_storage_warning() -> str | None:
+    """Return a short one-line storage warning if a conflict or pending operation exists.
+
+    Never touches the OS keystore in file mode and never raises.
+    """
+    try:
+        from notebooklm_tools.services.auth_storage import get_storage_status
+
+        status = get_storage_status()
+        if status.get("has_conflict"):
+            return "Storage conflict detected. Run 'nlm auth storage resolve'."
+        if status.get("has_pending_op"):
+            return "Pending storage operation detected. Run 'nlm auth storage status'."
+        if status.get("protected_residue"):
+            return "Protected storage residue present. Run 'nlm auth storage resolve file'."
+        return None
+    except Exception:
+        return None
+
+
+def _profile_summary() -> dict[str, Any]:
+    """Saved profiles with storage mode and problems - metadata only, never the keystore."""
+    from ...services import profiles as profile_service
+
+    try:
+        rows = []
+        for row in profile_service.list_profiles():
+            try:
+                st = profile_service.profile_storage_status(row["name"])
+            except Exception:
+                st = {}
+            rows.append(
+                {
+                    **row,
+                    "has_conflict": bool(st.get("has_conflict")),
+                    "has_pending_op": bool(st.get("has_pending_op")),
+                }
+            )
+        return {"active_profile": profile_service.get_active_profile(), "profiles": rows}
+    except Exception as exc:
+        return {"active_profile": None, "profiles": [], "profiles_error": str(exc)}
+
+
 @logged_tool()
 def server_info() -> dict[str, Any]:
     """Get version, auth status, and conservative MCP capability visibility.
@@ -143,22 +215,27 @@ def server_info() -> dict[str, Any]:
         - latest_version: Latest version on PyPI (or None if check failed)
         - update_available: True if a newer version is available
         - auth_status: configured | stale | unverified | not_configured | error
+        - storage_warning: Short warning if conflict/pending op exists (or None)
         - update_command: Command to run to update
         - mcp_capabilities: Built-in tool groups visible in this server process
         - provider_capabilities: Explicitly unprobed provider/account capabilities
+    - active_profile: Which saved account is in use and why (session switch or saved default)
+    - profiles: Saved accounts with email, storage mode (plain/protected) and any storage
+      problems. Metadata only; never opens the OS keystore.
     """
     latest = _get_latest_pypi_version()
     update_available = False
 
     if latest:
-        update_available = _compare_versions(__version__, latest)
+        update_available = is_newer_version(__version__, latest)
 
-    return {
+    info: dict[str, Any] = {
         "status": "success",
         "version": __version__,
         "latest_version": latest,
         "update_available": update_available,
         "auth_status": _check_auth_status(),
+        "storage_warning": _check_storage_warning(),
         "update_command": "uv tool upgrade notebooklm-mcp-cli",
         "pip_update_command": "pip install --upgrade notebooklm-mcp-cli",
         "mcp_capabilities": _runtime_capabilities(),
@@ -170,3 +247,6 @@ def server_info() -> dict[str, Any]:
             ),
         },
     }
+
+    info.update(_profile_summary())
+    return info

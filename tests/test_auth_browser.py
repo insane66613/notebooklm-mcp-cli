@@ -102,6 +102,70 @@ def test_get_chromium_path_selects_named_comet_on_macos():
     assert result == expected
 
 
+def test_edge_beta_is_a_supported_explicit_auth_browser():
+    from notebooklm_tools.utils.auth_browser import CHROMIUM_BROWSER_KEYS
+
+    assert "edge-beta" in CHROMIUM_BROWSER_KEYS
+
+
+def test_select_auth_backend_passes_edge_beta_preference():
+    from notebooklm_tools.utils.auth_browser import select_auth_backend
+
+    with (
+        patch(
+            "notebooklm_tools.utils.cdp._get_chromium_path",
+            return_value="msedge-beta",
+        ) as get_path,
+        patch(
+            "notebooklm_tools.utils.cdp.get_browser_display_name",
+            return_value="Microsoft Edge Beta",
+        ),
+        patch("notebooklm_tools.utils.firefox.get_firefox_path", return_value=None),
+    ):
+        backend = select_auth_backend("edge-beta")
+
+    get_path.assert_called_once_with("edge-beta")
+    assert backend == {"backend": "chromium_cdp", "browser": "Microsoft Edge Beta"}
+
+
+def test_get_chromium_path_selects_edge_beta_candidate(tmp_path, monkeypatch):
+    from notebooklm_tools.utils import cdp
+
+    beta = tmp_path / "msedge.exe"
+    beta.write_bytes(b"")
+    monkeypatch.setattr(cdp.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        cdp,
+        "_windows_browser_candidates",
+        lambda: [
+            ("Google Chrome", str(tmp_path / "missing-chrome.exe")),
+            ("Microsoft Edge Beta", str(beta)),
+        ],
+    )
+    monkeypatch.setattr(cdp, "_detected_browser_name", None)
+    monkeypatch.setattr(cdp, "_get_preferred_browser_path", lambda: "")
+
+    assert cdp._get_chromium_path("edge-beta") == str(beta)
+    assert cdp.get_browser_display_name() == "Microsoft Edge Beta"
+
+
+def test_platform_candidates_include_edge_beta():
+    from notebooklm_tools.utils.cdp import (
+        _LINUX_BROWSER_CANDIDATES,
+        _macos_browser_candidates,
+        _windows_browser_candidates,
+    )
+
+    assert ("Microsoft Edge Beta", "microsoft-edge-beta") in _LINUX_BROWSER_CANDIDATES
+    assert any(name == "Microsoft Edge Beta" for name, _ in _macos_browser_candidates())
+
+    beta_paths = [
+        path for name, path in _windows_browser_candidates() if name == "Microsoft Edge Beta"
+    ]
+    assert beta_paths
+    assert any(r"Microsoft\Edge Beta\Application\msedge.exe" in path for path in beta_paths)
+
+
 def test_explicit_browser_path_wins_over_named_discovery(tmp_path):
     from notebooklm_tools.utils.cdp import _get_chromium_path
 
@@ -287,50 +351,6 @@ def test_get_headers_flattens_list_cookies(tmp_path, monkeypatch):
     assert headers["X-Goog-Csrf-Token"] == "csrf1"
 
 
-def test_edge_beta_is_a_supported_explicit_auth_browser():
-    from notebooklm_tools.utils.auth_browser import CHROMIUM_BROWSER_KEYS
-
-    assert "edge-beta" in CHROMIUM_BROWSER_KEYS
-
-
-def test_select_auth_backend_passes_edge_beta_preference():
-    from notebooklm_tools.utils.auth_browser import select_auth_backend
-
-    with (
-        patch(
-            "notebooklm_tools.utils.cdp._get_chromium_path", return_value="msedge-beta"
-        ) as get_path,
-        patch(
-            "notebooklm_tools.utils.cdp.get_browser_display_name",
-            return_value="Microsoft Edge Beta",
-        ),
-    ):
-        backend = select_auth_backend("edge-beta")
-
-    get_path.assert_called_once_with("edge-beta")
-    assert backend == {"backend": "chromium_cdp", "browser": "Microsoft Edge Beta"}
-
-
-def test_get_chromium_path_selects_edge_beta_candidate(tmp_path, monkeypatch):
-    from notebooklm_tools.utils import cdp
-
-    beta = tmp_path / "msedge.exe"
-    beta.write_bytes(b"")
-    monkeypatch.setattr(cdp.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(
-        cdp,
-        "_windows_browser_candidates",
-        lambda: [
-            ("Google Chrome", str(tmp_path / "missing-chrome.exe")),
-            ("Microsoft Edge Beta", str(beta)),
-        ],
-    )
-    monkeypatch.setattr(cdp, "_detected_browser_name", None)
-
-    assert cdp._get_chromium_path("edge-beta") == str(beta)
-    assert cdp.get_browser_display_name() == "Microsoft Edge Beta"
-
-
 def test_windows_candidates_include_edge_beta_install_locations():
     from notebooklm_tools.utils.cdp import _windows_browser_candidates
 
@@ -339,3 +359,185 @@ def test_windows_candidates_include_edge_beta_install_locations():
     ]
     assert beta_paths
     assert any(r"Microsoft\Edge Beta\Application\msedge.exe" in path for path in beta_paths)
+
+
+def test_get_headers_uses_saved_base_host(tmp_path, monkeypatch):
+    """Origin/Referer follow the host the account was signed in on (issue #332)."""
+    from notebooklm_tools.core.auth import AuthManager
+
+    monkeypatch.setenv("NOTEBOOKLM_MCP_CLI_PATH", str(tmp_path))
+    monkeypatch.delenv("NOTEBOOKLM_BASE_URL", raising=False)
+
+    auth = AuthManager("default")
+    auth.save_profile(
+        cookies=[{"name": "SID", "value": "google", "domain": ".google.com"}],
+        csrf_token="csrf1",
+        email="u@example.com",
+        base_host="notebook.google.com",
+    )
+
+    headers = auth.get_headers()
+
+    assert headers["Origin"] == "https://notebook.google.com"
+    assert headers["Referer"] == "https://notebook.google.com/"
+
+
+def test_get_headers_defaults_host_when_unset(tmp_path, monkeypatch):
+    """No saved host falls back to the default (issue #332)."""
+    from notebooklm_tools.core.auth import AuthManager
+
+    monkeypatch.setenv("NOTEBOOKLM_MCP_CLI_PATH", str(tmp_path))
+    monkeypatch.delenv("NOTEBOOKLM_BASE_URL", raising=False)
+
+    auth = AuthManager("default")
+    auth.save_profile(
+        cookies=[{"name": "SID", "value": "google", "domain": ".google.com"}],
+        csrf_token="csrf1",
+        email="u@example.com",
+    )
+
+    headers = auth.get_headers()
+
+    assert headers["Origin"] == "https://notebooklm.google.com"
+    assert headers["Referer"] == "https://notebooklm.google.com/"
+
+
+def test_headless_auth_forwards_diagnostic_mode_to_chromium(monkeypatch):
+    """Explicit refresh diagnostics must reach the Chromium backend."""
+    from notebooklm_tools.utils import auth_browser, cdp
+
+    calls = {}
+    monkeypatch.setattr(
+        auth_browser,
+        "_get_saved_browser_backend",
+        lambda _profile: "chromium_cdp",
+    )
+    monkeypatch.setattr(
+        auth_browser,
+        "select_auth_backend",
+        lambda: {"backend": "chromium_cdp", "browser": "Google Chrome"},
+    )
+
+    def fake_headless(
+        *,
+        port,
+        timeout,
+        profile_name,
+        expected_revision,
+        force,
+        raise_on_error,
+    ):
+        calls.update(
+            port=port,
+            profile_name=profile_name,
+            raise_on_error=raise_on_error,
+        )
+        return None
+
+    monkeypatch.setattr(cdp, "run_headless_auth", fake_headless)
+
+    result = auth_browser.run_headless_auth(
+        profile_name="work",
+        raise_on_error=True,
+    )
+
+    assert result is None
+    assert calls == {"port": 9223, "profile_name": "work", "raise_on_error": True}
+
+
+def test_headless_auth_diagnostic_mode_preserves_backend_fallback(monkeypatch):
+    """A diagnostic failure in one backend must not block a later fallback."""
+    from notebooklm_tools.core.exceptions import AuthenticationError
+    from notebooklm_tools.utils import auth_browser, cdp, firefox
+
+    token = object()
+    calls = []
+    monkeypatch.setattr(
+        auth_browser,
+        "_get_saved_browser_backend",
+        lambda _profile: "firefox_profile",
+    )
+    monkeypatch.setattr(
+        auth_browser,
+        "select_auth_backend",
+        lambda: {"backend": "firefox_profile", "browser": "Firefox"},
+    )
+
+    def fail_firefox(**kwargs):
+        calls.append(("firefox", kwargs["raise_on_error"]))
+        raise AuthenticationError(message="Firefox profile unavailable")
+
+    def succeed_chromium(**kwargs):
+        calls.append(("chromium", kwargs["raise_on_error"]))
+        return token
+
+    monkeypatch.setattr(firefox, "run_headless_auth", fail_firefox)
+    monkeypatch.setattr(cdp, "run_headless_auth", succeed_chromium)
+
+    result = auth_browser.run_headless_auth(
+        profile_name="work",
+        raise_on_error=True,
+    )
+
+    assert result is token
+    assert calls == [("firefox", True), ("chromium", True)]
+
+
+def test_headless_auth_diagnostic_mode_reports_preferred_backend_failure(monkeypatch):
+    """A later fallback's failure must not hide the preferred backend's real error."""
+    import pytest
+
+    from notebooklm_tools.core.exceptions import AuthenticationError
+    from notebooklm_tools.utils import auth_browser, cdp, firefox
+
+    monkeypatch.setattr(auth_browser, "_get_saved_browser_backend", lambda _p: "firefox_profile")
+    monkeypatch.setattr(
+        auth_browser,
+        "select_auth_backend",
+        lambda: {"backend": "firefox_profile", "browser": "Firefox"},
+    )
+
+    def fail_firefox(**kwargs):
+        raise AuthenticationError(message="Firefox signed out")
+
+    def fail_chromium(**kwargs):
+        raise AuthenticationError(message="No saved browser profile is available")
+
+    monkeypatch.setattr(firefox, "run_headless_auth", fail_firefox)
+    monkeypatch.setattr(cdp, "run_headless_auth", fail_chromium)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        auth_browser.run_headless_auth(profile_name="work", raise_on_error=True)
+
+    assert exc_info.value.message == "Firefox signed out"
+
+
+def test_firefox_headless_auth_raises_when_profile_missing_in_diagnostic_mode(monkeypatch):
+    import pytest
+
+    from notebooklm_tools.core.exceptions import AuthenticationError
+    from notebooklm_tools.utils import firefox
+
+    monkeypatch.setattr("notebooklm_tools.utils.config.get_auth_storage_mode", lambda _p: "file")
+    monkeypatch.setattr(firefox, "has_firefox_profile", lambda _p: False)
+
+    assert firefox.run_headless_auth(profile_name="work") is None
+    with pytest.raises(AuthenticationError, match="No saved Firefox profile"):
+        firefox.run_headless_auth(profile_name="work", raise_on_error=True)
+
+
+def test_firefox_headless_auth_raises_when_cookies_invalid_in_diagnostic_mode(monkeypatch):
+    import pytest
+
+    from notebooklm_tools.core.exceptions import AuthenticationError
+    from notebooklm_tools.utils import firefox
+
+    monkeypatch.setattr("notebooklm_tools.utils.config.get_auth_storage_mode", lambda _p: "file")
+    monkeypatch.setattr(firefox, "has_firefox_profile", lambda _p: True)
+    monkeypatch.setattr(firefox, "get_firefox_profile_dir", lambda _p: Path("."))
+    monkeypatch.setattr(firefox, "_read_google_cookies", lambda _d: [])
+    monkeypatch.setattr("notebooklm_tools.core.auth.validate_cookies", lambda _c: False)
+
+    assert firefox.run_headless_auth(profile_name="work") is None
+    with pytest.raises(AuthenticationError, match="required NotebookLM cookies"):
+        firefox.run_headless_auth(profile_name="work", raise_on_error=True)

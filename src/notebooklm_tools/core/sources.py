@@ -34,14 +34,43 @@ class _NotebookLookupProtocol(Protocol):
     def get_notebook(self, notebook_id: str) -> Any: ...
 
 
+def _drive_file_metadata(metadata: list[Any]) -> list[Any] | None:
+    """Return the Drive file tuple stored at ``metadata[9]``, when present."""
+    drive_metadata = metadata[9] if len(metadata) > 9 else None
+    return drive_metadata if isinstance(drive_metadata, list) else None
+
+
+def _drive_file_id(source_type: object, metadata: list[Any]) -> str | None:
+    """Return the Drive ID for a type-14 file imported through the Drive picker."""
+    if source_type != constants.SOURCE_TYPE_WORD_DOC:
+        return None
+    drive_metadata = _drive_file_metadata(metadata)
+    drive_id = drive_metadata[0] if drive_metadata else None
+    return drive_id if isinstance(drive_id, str) and drive_id else None
+
+
+def _source_url(source_type: object, metadata: list[Any]) -> str | None:
+    """Return a source's URL from its metadata.
+
+    Web sources carry the URL at ``metadata[7][0]``. YouTube sources (type 9) leave
+    that slot empty and carry ``[url, video_id, channel]`` at ``metadata[5]``.
+    """
+    candidates = [metadata[7] if len(metadata) > 7 else None]
+    if source_type == constants.SOURCE_TYPE_YOUTUBE:
+        candidates.append(metadata[5] if len(metadata) > 5 else None)
+    for info in candidates:
+        if isinstance(info, list) and info and isinstance(info[0], str):
+            return info[0]
+    return None
+
+
 def _resolve_source_type_name(source_type: object, metadata: list[Any]) -> str:
     """Resolve ambiguous source codes using explicit MIME metadata when available."""
     if source_type == constants.SOURCE_TYPE_WORD_DOC:
         mime_type = metadata[19] if len(metadata) > 19 else None
-        if not isinstance(mime_type, str) and len(metadata) > 9:
-            drive_metadata = metadata[9]
-            if isinstance(drive_metadata, list) and len(drive_metadata) > 2:
-                mime_type = drive_metadata[2]
+        drive_metadata = _drive_file_metadata(metadata)
+        if not isinstance(mime_type, str) and drive_metadata and len(drive_metadata) > 2:
+            mime_type = drive_metadata[2]
         if mime_type == "application/pdf":
             return "pdf"
 
@@ -316,26 +345,33 @@ class SourceMixin(BaseClient):
 
                         source_type = None
                         drive_doc_id = None
+                        drive_file_id = None
                         if isinstance(metadata, list):
                             if len(metadata) > 4:
                                 source_type = metadata[4]
                             # Drive doc info at metadata[0]
                             if len(metadata) > 0 and isinstance(metadata[0], list):
                                 drive_doc_id = metadata[0][0] if metadata[0] else None
+                            # Drive-picker files (type 14) carry the Drive ID at metadata[9][0].
+                            drive_file_id = _drive_file_id(source_type, metadata)
+                            if drive_doc_id is None:
+                                drive_doc_id = drive_file_id
 
-                        # Google Docs (type 1) and Slides/Sheets (type 2) are stored in Drive
-                        # and can be synced if they have a drive_doc_id
+                        # Drive-linked type-14 files are eligible for a manual
+                        # sync attempt when metadata includes their Drive ID.
+                        # Individual RPC attempts may still fail for a source.
                         can_sync = drive_doc_id is not None and source_type in (
                             self.SOURCE_TYPE_GOOGLE_DOCS,
                             self.SOURCE_TYPE_GOOGLE_OTHER,
+                            constants.SOURCE_TYPE_WORD_DOC,
                         )
 
-                        # Extract URL if available (position 7)
-                        url = None
-                        if isinstance(metadata, list) and len(metadata) > 7:
-                            url_info = metadata[7]
-                            if isinstance(url_info, list) and len(url_info) > 0:
-                                url = url_info[0]
+                        # Extract URL (position 7 for web, position 5 for YouTube)
+                        url = (
+                            _source_url(source_type, metadata)
+                            if isinstance(metadata, list)
+                            else None
+                        )
 
                         # Extract processing status from src[3][1]
                         # 1=processing, 2=ready, 3=error/done(audio),
@@ -1075,11 +1111,7 @@ class SourceMixin(BaseClient):
                         type_code = metadata[4]
                         source_type = _resolve_source_type_name(type_code, metadata)
 
-                    # URL might be at position 7 for web sources
-                    if len(metadata) > 7 and isinstance(metadata[7], list):
-                        url_info = metadata[7]
-                        if len(url_info) > 0 and isinstance(url_info[0], str):
-                            url = url_info[0]
+                    url = _source_url(metadata[4] if len(metadata) > 4 else None, metadata)
 
             # Extract content from result[3][0] - array of content blocks
             if len(result) > 3 and isinstance(result[3], list):

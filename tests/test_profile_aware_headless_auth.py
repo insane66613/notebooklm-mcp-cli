@@ -7,7 +7,7 @@ def test_auth_browser_headless_dispatcher_forwards_requested_cdp_port(monkeypatc
     """The backend dispatcher must preserve the broker's dedicated CDP port."""
     import notebooklm_tools.utils.auth_browser as auth_browser
 
-    calls: list[tuple[int, int, str]] = []
+    calls: list[tuple[int, int, str, bool]] = []
     monkeypatch.setattr(auth_browser, "_get_saved_browser_backend", lambda _profile: "chromium_cdp")
     monkeypatch.setattr(
         auth_browser,
@@ -16,8 +16,8 @@ def test_auth_browser_headless_dispatcher_forwards_requested_cdp_port(monkeypatc
     )
     monkeypatch.setattr(
         "notebooklm_tools.utils.cdp.run_headless_auth",
-        lambda *, port, timeout, profile_name: (
-            calls.append((port, timeout, profile_name)) or object()
+        lambda *, port, timeout, profile_name, expected_revision=None, force=None, raise_on_error=False: (
+            calls.append((port, timeout, profile_name, raise_on_error)) or object()
         ),
         raising=True,
     )
@@ -25,7 +25,7 @@ def test_auth_browser_headless_dispatcher_forwards_requested_cdp_port(monkeypatc
     result = auth_browser.run_headless_auth(profile_name="pte", timeout=45, port=9224)
 
     assert result is not None
-    assert calls == [(9224, 45, "pte")]
+    assert calls == [(9224, 45, "pte", False)]
 
 
 def test_mcp_refresh_auth_uses_configured_default_profile(monkeypatch):
@@ -47,7 +47,14 @@ def test_mcp_refresh_auth_uses_configured_default_profile(monkeypatch):
         raising=True,
     )
 
-    def fake_headless_auth(*, profile_name, timeout=30):
+    def fake_headless_auth(
+        *,
+        profile_name,
+        timeout=30,
+        expected_revision=None,
+        force=False,
+        **kwargs,
+    ):
         calls.append(profile_name)
         return AuthTokens(cookies={"SID": "x"}, extracted_at=1.0)
 
@@ -89,7 +96,15 @@ def test_mcp_refresh_auth_uses_saved_profile_when_disk_tokens_are_stale(monkeypa
         raising=True,
     )
 
-    def fake_headless_auth(*, profile_name, timeout=30):
+    def fake_headless_auth(
+        *,
+        profile_name,
+        timeout=30,
+        port=9223,
+        expected_revision=None,
+        force=None,
+        **kwargs,
+    ):
         calls.append(profile_name)
         return AuthTokens(cookies={"SID": "fresh"}, extracted_at=2.0)
 
@@ -126,7 +141,14 @@ def test_core_recovery_uses_configured_default_profile(monkeypatch):
         raising=True,
     )
 
-    def fake_headless_auth(*, profile_name, timeout=30):
+    def fake_headless_auth(
+        *,
+        profile_name,
+        timeout=30,
+        expected_revision=None,
+        force=False,
+        **kwargs,
+    ):
         calls.append(profile_name)
         return AuthTokens(
             cookies={"SID": "x"},
@@ -150,3 +172,34 @@ def test_core_recovery_uses_configured_default_profile(monkeypatch):
     assert client.cookies == {"SID": "x"}
     assert client.csrf_token == "csrf"
     assert client._session_id == "sid"
+
+
+def test_mcp_refresh_auth_uses_broker_reserved_headless_port(monkeypatch):
+    """Broker-managed MCP refresh should prefer isolated headless recovery."""
+    import notebooklm_tools.mcp.tools.auth as auth_tools
+    from notebooklm_tools.core.auth import AuthTokens
+
+    calls = []
+    monkeypatch.delenv("NOTEBOOKLM_COOKIES", raising=False)
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_BROKER_ENABLED", "true")
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_BROKER_PROFILES", "pte,harmonywave13")
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_BROKER_HEADLESS_CDP_PORT", "9224")
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_BROKER_CDP_PORT_STRIDE", "2")
+    monkeypatch.setattr("notebooklm_tools.services.auth.load_cached_tokens", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        "notebooklm_tools.utils.config.get_config",
+        lambda: SimpleNamespace(auth=SimpleNamespace(default_profile="harmonywave13")),
+    )
+    monkeypatch.setattr(
+        "notebooklm_tools.utils.auth_browser.run_headless_auth",
+        lambda **kwargs: calls.append(kwargs) or AuthTokens(cookies={"SID": "x"}),
+    )
+    monkeypatch.setattr(auth_tools, "reset_client", lambda: None)
+    monkeypatch.setattr(auth_tools, "get_client", lambda: object())
+
+    assert auth_tools.refresh_auth()["status"] == "success"
+    assert calls == [{"profile_name": "harmonywave13", "port": 9226, "raise_on_error": True}]
+
+    # An explicit non-default profile must use its own reserved CDP port.
+    assert auth_tools.refresh_auth(profile="pte")["status"] == "success"
+    assert calls[-1] == {"profile_name": "pte", "port": 9224, "raise_on_error": True}

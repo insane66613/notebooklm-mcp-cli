@@ -1,6 +1,6 @@
 # MCP Guide
 
-Complete reference for the Gemini Notebook (formerly Google NotebookLM) MCP server — **43 tools** for AI assistants.
+Complete reference for the Gemini Notebook (formerly Google NotebookLM) MCP server — **53 tools** for AI assistants.
 
 ## Installation
 
@@ -39,6 +39,8 @@ Or use the standalone auth tool:
 nlm login
 ```
 
+A new profile asks whether to store the login **protected** (OS keystore, recommended) or as a plain file before the browser opens. To use a different Google account from inside an AI app, use the `profile` tool (see [Profiles & Aliases](#profiles--aliases-2-tools)).
+
 ---
 
 ## Tool Reference
@@ -65,6 +67,11 @@ nlm login
 | `source_describe` | Get AI summary with keywords |
 | `source_get_content` | Get raw text content |
 | `source_rename` | Rename a source in a notebook |
+
+**Source URLs:** CLI `nlm source list --json` and `nlm source get --json` return
+URLs for web and YouTube sources. The current MCP `source_list_drive` and
+`source_get_content` responses do not expose a `url` field. Use the CLI when
+the original source URL is required; do not infer it from transcript text.
 
 **`source_list_drive` parameters:**
 ```python
@@ -106,15 +113,16 @@ to the notebook). For longer operations, use `notebook_query_start` and poll
 returns a structured error with a retry hint rather than an uninformative
 transport failure.
 
-### Chat Sessions (3 tools)
+### Chat Sessions (4 tools)
 
 | Tool | Description |
 |------|-------------|
 | `chat_list` | List chat sessions for a notebook |
 | `chat_get` | Get full transcript of a chat session (defaults to latest) |
 | `chat_export` | Export a chat transcript to Markdown or JSON |
+| `chat_save_to_note` | Save a chat (or one turn) as a Note in the notebook |
 
-### Studio Content (4 tools)
+### Studio Content (8 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -122,17 +130,57 @@ transport failure.
 | `studio_status` | Check generation progress |
 | `studio_delete` | Delete artifact (requires `confirm=True`) |
 | `studio_revise` | Revise slides in existing deck (requires `confirm=True`) |
+| `report` | **Unified** - Interactive report elements: `action=get` (markdown + elements), `elements` (list; optional `wait_for`, `include_content`), `generate` (validate a plan; runs with `confirm=True`) |
 
 **`studio_create` artifact types:**
 - `audio` - Podcast (formats: deep_dive, brief, critique, debate)
 - `video` - Video overview (formats: explainer, brief, cinematic, short)
-- `report` - Text report (Briefing Doc, Study Guide, Blog Post)
+- `report` - Report (Briefing Doc, Study Guide, Blog Post, or **Interactive**)
 - `quiz` - Multiple choice quiz
 - `flashcards` - Study flashcards
 - `mind_map` - Visual mind map
 - `slide_deck` - Presentation slides
 - `infographic` - Visual infographic
 - `data_table` - Structured data table
+
+**Interactive reports (type 11):** create with
+`studio_create(artifact_type="report", report_format="Interactive", report_template="learning_overview", custom_prompt="...", confirm=True)`.
+The report weaves Studio elements (audio, video, mind map, infographic,
+flashcards, slide deck, quiz) into a single browsable document as recommended
+placeholders:
+
+```python
+# 1. Create interactive report
+studio_create(notebook_id, artifact_type="report", report_format="Interactive",
+              custom_prompt="Summarize the key ideas with a quiz", confirm=True)
+# ... poll studio_status until the artifact status is "completed" ...
+
+# 2. Read report and list suggested elements
+report(notebook_id, artifact_id, action="get")                 # markdown + element list
+listing = report(notebook_id, artifact_id, action="elements")  # ids, types, sections, settings
+
+# 3. Generation: validate the plan first (no confirm), then run it
+plan = [
+    {"element_id": "el-1", "settings": {"difficulty": "hard", "question_amount": "more"}},
+    {"element_id": "el-2", "steering_prompt": "Custom anchored prompt"},
+]
+preview = report(notebook_id, artifact_id, action="generate", plan=plan)
+# Show preview to user; after approval:
+batch_result = report(notebook_id, artifact_id, action="generate", plan=plan, confirm=True)
+
+# 4. Bounded wait and inline review content
+results = report(
+    notebook_id,
+    artifact_id,
+    action="elements",
+    wait_for=["el-1", "el-2"],
+    timeout=600,
+    include_content=True,
+)
+```
+
+Omit `steering_prompt` to use the element card's description (same as a plain
+"Generate" in the UI), or pass your own to steer the element.
 
 ### Downloads (2 tools)
 
@@ -201,14 +249,31 @@ label(notebook_id="abc", action="delete", label_id="...", confirm=True)
 
 | Tool | Description |
 |------|-------------|
-| `refresh_auth` | Reload auth tokens |
+| `refresh_auth` | Validate/reload tokens or recover a saved session; optional `profile` targets a named account without switching the active account (File and Protected storage) |
 | `save_auth_tokens` | Save cookies (fallback method) |
+
+### Profiles & Aliases (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `profile` | **Unified** — list saved accounts, show storage status, switch account (action: list, status, switch) |
+| `alias` | **Unified** — short names for notebook IDs (action: list, get, set, delete); every `notebook_id` accepts an alias |
+
+```python
+profile(action="list")                                   # accounts, storage mode, which is active
+profile(action="switch", name="personal")                # this MCP server, until it restarts
+profile(action="switch", name="work", make_default=True) # ALSO the saved default (CLI + future sessions)
+```
+
+A switch applies to the whole MCP server process. Apps that share one server across chats (Claude Desktop, CoWork) apply it to every open chat until you quit the app, so while a switch is active each tool result carries an `active_profile_note`. If the server was started with `NOTEBOOKLM_COOKIES`, switching is refused because those cookies override saved profiles. Aliases are shared across all profiles.
 
 ### Server (1 tool)
 
 | Tool | Description |
 |------|-------------|
-| `server_info` | Get version and check for updates |
+| `server_info` | Get version, update check, `storage_warning` diagnostic, and the saved profiles with their storage mode |
+
+`server_info` returns server metadata, update availability, and an optional `storage_warning` field. If credential storage has an unresolved conflict, an unfinished migration marker, or an inaccessible keystore, `storage_warning` provides clear instructions on which `nlm auth storage` command to run.
 
 ### Batch & Cross-Notebook (2 tools)
 
@@ -237,12 +302,13 @@ cross_notebook_query(query="Everything", all=True)
 
 | Tool | Description |
 |------|-------------|
-| `pipeline` | **Unified** — List or run multi-step workflows (action: list, run) |
+| `pipeline` | **Unified** — List, run or create multi-step workflows (action: list, run, create) |
 
 **`pipeline` actions:**
 ```python
 pipeline(action="list")  # List available pipelines
 pipeline(action="run", notebook_id="...", pipeline_name="ingest-and-podcast", input_url="https://...")
+pipeline(action="create", pipeline_name="mine", description="...", steps=[{"action": "notebook_query", "params": {"query": "Summarize"}}])
 ```
 
 **Built-in pipelines:** `ingest-and-podcast`, `research-and-report`, `multi-format`
@@ -358,6 +424,7 @@ pipeline(action="run", notebook_id="abc", pipeline_name="ingest-and-podcast", in
 | `NOTEBOOKLM_MCP_DEBUG` | Enable debug logging |
 | `NOTEBOOKLM_HL` | Interface language and default artifact locale, including regional BCP-47 values such as `es-419` (default: en) |
 | `NOTEBOOKLM_QUERY_TIMEOUT` | Query timeout (seconds) |
+| `NOTEBOOKLM_ASYNC_QUERY_MAX_INFLIGHT` | Maximum concurrent `notebook_query_start` workers (default: 8; minimum: 1) |
 | `NOTEBOOKLM_BASE_URL` | Override base URL for Enterprise/Workspace (default: `https://notebooklm.google.com`) |
 | `NOTEBOOKLM_PROJECT_ID` | Required GCP project ID or number for Gemini Notebook Enterprise |
 | `NOTEBOOKLM_LOCATION` | Enterprise location/multi-region (`global`, `us`, or `eu`; default: `global`) |
@@ -371,7 +438,7 @@ pipeline(action="run", notebook_id="abc", pipeline_name="ingest-and-podcast", in
 
 ## Context Window Tips
 
-This MCP has **43 tools** which consume context. Best practices:
+This MCP has **53 tools** which consume context. Best practices:
 
 - **Disable when not using**: In Claude Code, use `@gemini-notebook-mcp` to toggle
 - **Hide tools you don't need**: See [Selective tool exposure](#selective-tool-exposure) below to expose only a subset
@@ -406,16 +473,26 @@ Unknown group names are ignored. Changes take effect on server restart.
 
 ## IDE Configuration
 
-The easiest way to configure any tool is with `nlm setup`:
+The easiest way to configure supported tools is with the guided wizard:
 
 ```bash
-nlm setup add claude-code       # Claude Code
-nlm setup add gemini            # Gemini CLI
-nlm setup add github-copilot    # GitHub Copilot
-nlm setup add cursor            # Cursor
-nlm setup add windsurf          # Windsurf
-nlm setup add json              # Any other tool (interactive JSON generator)
+nlm setup
 ```
+
+Choose **Show my tools' status** to see what is connected, **Add the MCP to
+my tools/agents** to connect detected clients (nothing is pre-selected; entries
+still using the old `notebooklm-mcp` name are offered under **Needs a fix** and
+renamed to `gemini-notebook-mcp`), **Add the skill to my tools/agents** for the
+optional skill (including an upload file for Claude Desktop Chat/Cowork and
+claude.ai), **Remove an MCP or skill**, **Credential protection** (protect or
+restore your saved logins), or **Copy MCP setup for a tool not
+listed** to copy a config snippet. Esc goes back from any screen. MCP setup
+defaults to the app/user-level configuration. The optional skill defaults to
+all projects (user level); project-level installation targets the current
+folder. Codex CLI
+and the ChatGPT desktop app share one MCP configuration on the same host.
+GitHub Copilot uses the VS Code user profile in the wizard; the direct command
+without `--scope user` targets the current workspace.
 
 <details>
 <summary>Manual configuration</summary>

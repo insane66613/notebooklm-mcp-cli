@@ -1,14 +1,78 @@
 #!/usr/bin/env python3
 """Tests for DownloadMixin."""
 
+import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
 from notebooklm_tools.core.base import BaseClient
-from notebooklm_tools.core.download import DownloadMixin
+from notebooklm_tools.core.download import DownloadMixin, _create_download_temp_path
 from notebooklm_tools.core.errors import ArtifactDownloadError, ArtifactParseError
+
+
+def test_download_temp_paths_are_unique_and_same_directory(tmp_path):
+    output = tmp_path / "artifact.bin"
+    first = _create_download_temp_path(output)
+    second = _create_download_temp_path(output)
+    try:
+        assert first != second
+        assert first.parent == tmp_path
+        assert second.parent == tmp_path
+        assert first.name.startswith(".nlm-download-")
+        assert second.name.startswith(".nlm-download-")
+        assert first.exists()
+        assert second.exists()
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+
+
+def test_failed_download_cleans_only_its_own_temp_file(tmp_path):
+    mixin = DownloadMixin(cookies={"SID": "cookie"}, csrf_token="test")
+    output = tmp_path / "artifact.bin"
+    unrelated = _create_download_temp_path(output)
+    unrelated.write_bytes(b"keep")
+
+    request = httpx.Request("GET", "https://example.com/file")
+    response = httpx.Response(500, request=request)
+
+    class FailingResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def stream(self, method, url):
+            return FailingResponse()
+
+    try:
+        with (
+            patch("notebooklm_tools.core.download.httpx.Client", FakeClient),
+            pytest.raises(ArtifactDownloadError),
+        ):
+            mixin._download_url_sync("https://example.com/file", str(output))
+
+        assert unrelated.read_bytes() == b"keep"
+        assert list(tmp_path.glob(".nlm-download-*.tmp")) == [unrelated]
+        assert not output.exists()
+    finally:
+        unrelated.unlink(missing_ok=True)
 
 
 class TestDownloadMixinImport:
@@ -68,6 +132,13 @@ class TestDownloadMixinImport:
 
 class TestDownloadMixinMethods:
     """Test DownloadMixin method behavior."""
+
+    def _video_artifact(self, url: str) -> list:
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        artifact = ["video-1", None, mixin.STUDIO_TYPE_VIDEO, None, 3]
+        artifact.extend([None] * 3)
+        artifact.append([[[url, 4, "video/mp4"]]])
+        return artifact
 
     def _audio_artifact(self, url: str) -> list:
         mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
@@ -148,11 +219,13 @@ class TestDownloadMixinMethods:
                 return FakeResponse()
 
         output = tmp_path / "table.xlsx"
+        output.write_bytes(b"old")
         with patch("notebooklm_tools.core.download.httpx.Client", FakeClient):
             result = mixin.download_data_table("nb-1", str(output), "xlsx-1")
 
         assert result == str(output)
         assert output.read_bytes() == b"PK\x03\x04xlsx"
+        assert not list(tmp_path.glob(".nlm-download-*.tmp"))
         assert captured == {
             "method": "GET",
             "url": "https://contribution.usercontent.google/download?c=download-token",
@@ -529,6 +602,72 @@ class TestDownloadMixinMethods:
         assert mixin._list_raw.call_count == 2
         assert mixin._download_url.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_download_video_retries_transient_google_media_404(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        first_url = "https://lh3.googleusercontent.com/notebooklm/video-1"
+        second_url = "https://lh3.googleusercontent.com/notebooklm/video-2"
+        retryable_error = self._download_error(404, first_url)
+        mixin._list_raw = Mock(
+            side_effect=[
+                [self._video_artifact(first_url)],
+                [self._video_artifact(second_url)],
+            ]
+        )
+        mixin._download_url = AsyncMock(side_effect=[retryable_error, "/tmp/video.mp4"])
+        mixin._VIDEO_DOWNLOAD_RETRY_DELAYS = (0,)
+
+        result = await mixin.download_video("nb-1", "/tmp/video.mp4", artifact_id="video-1")
+
+        assert result == "/tmp/video.mp4"
+        assert mixin._list_raw.call_count == 2
+        mixin._download_url.assert_any_await(first_url, "/tmp/video.mp4", None)
+        mixin._download_url.assert_any_await(second_url, "/tmp/video.mp4", None)
+
+    @pytest.mark.asyncio
+    async def test_download_video_ignores_malformed_secondary_media_entries(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        url = "https://lh3.googleusercontent.com/notebooklm/video-1"
+        artifact = self._video_artifact(url)
+        artifact[8][0].append(42)
+        mixin._list_raw = Mock(return_value=[artifact])
+        mixin._download_url = AsyncMock(return_value="/tmp/video.mp4")
+
+        result = await mixin.download_video("nb-1", "/tmp/video.mp4")
+
+        assert result == "/tmp/video.mp4"
+        mixin._download_url.assert_awaited_once_with(url, "/tmp/video.mp4", None)
+
+    @pytest.mark.asyncio
+    async def test_download_video_does_not_retry_unrelated_404(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        url = "https://lh3.googleusercontent.com/notebooklm/video-1"
+        unrelated_error = self._download_error(404, "https://example.com/not-found")
+        mixin._list_raw = Mock(return_value=[self._video_artifact(url)])
+        mixin._download_url = AsyncMock(side_effect=unrelated_error)
+        mixin._VIDEO_DOWNLOAD_RETRY_DELAYS = (0,)
+
+        with pytest.raises(ArtifactDownloadError) as exc_info:
+            await mixin.download_video("nb-1", "/tmp/video.mp4", artifact_id="video-1")
+
+        assert exc_info.value is unrelated_error
+        mixin._download_url.assert_awaited_once_with(url, "/tmp/video.mp4", None)
+
+    @pytest.mark.asyncio
+    async def test_download_video_reports_propagation_after_retry_exhaustion(self):
+        mixin = DownloadMixin(cookies={"test": "cookie"}, csrf_token="test")
+        url = "https://lh3.googleusercontent.com/notebooklm/video-1"
+        retryable_error = self._download_error(404, url)
+        mixin._list_raw = Mock(return_value=[self._video_artifact(url)])
+        mixin._download_url = AsyncMock(side_effect=retryable_error)
+        mixin._VIDEO_DOWNLOAD_RETRY_DELAYS = (0,)
+
+        with pytest.raises(ArtifactDownloadError) as exc_info:
+            await mixin.download_video("nb-1", "/tmp/video.mp4", artifact_id="video-1")
+
+        assert "still propagating" in exc_info.value.details
+        assert mixin._download_url.await_count == 2
+
 
 class TestDownloadUrlCookies:
     """Cookie handling for cross-domain artifact downloads."""
@@ -590,6 +729,7 @@ class TestDownloadUrlCookies:
                 return MockStreamResponse()
 
         output = tmp_path / "out.bin"
+        output.write_bytes(b"old")
 
         with patch("notebooklm_tools.core.download.httpx.AsyncClient", MockAsyncClient):
             result = await mixin._download_url(
@@ -598,6 +738,7 @@ class TestDownloadUrlCookies:
 
         assert result == str(output)
         assert output.read_bytes() == b"data"
+        assert not list(tmp_path.glob(".nlm-download-*.tmp"))
 
         cookies = captured["cookies"]
         assert cookies.get("SID", domain=".google.com") == "sid-value"
@@ -772,3 +913,41 @@ class TestStudioMindMapDownload:
 
         assert out == str(tmp_path / "quiz.json")
         assert mock_content.call_args[0][1] == "q-1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_download_temp_file_honors_umask_not_owner_only(tmp_path):
+    umask = os.umask(0)
+    os.umask(umask)
+    temp = _create_download_temp_path(tmp_path / "artifact.bin")
+    try:
+        assert temp.stat().st_mode & 0o777 == 0o666 & ~umask
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def test_interrupted_download_removes_its_temp_file(tmp_path):
+    mixin = DownloadMixin(cookies={"SID": "cookie"}, csrf_token="test")
+    output = tmp_path / "artifact.bin"
+
+    class InterruptedClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def stream(self, method, url):
+            raise KeyboardInterrupt
+
+    with (
+        patch("notebooklm_tools.core.download.httpx.Client", InterruptedClient),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        mixin._download_url_sync("https://example.com/file", str(output))
+
+    assert not list(tmp_path.glob(".nlm-download-*.tmp"))
+    assert not output.exists()

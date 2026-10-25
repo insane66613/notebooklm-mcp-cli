@@ -14,7 +14,7 @@ Gemini Notebook uses browser cookies for authentication (there is no official AP
 - Chromium-family browsers use Chrome DevTools Protocol (CDP)
 - Firefox uses an isolated profile and reads its cookie store directly (no CDP or WebDriver required)
 
-**Supported browsers**: Google Chrome, Arc (macOS), Dia (macOS) Brave, Microsoft Edge, Chromium, Firefox, Vivaldi, Opera.
+**Supported browsers**: Google Chrome, Arc (macOS), Dia (macOS) Brave, Microsoft Edge, Microsoft Edge Beta, Chromium, Firefox, Vivaldi, Opera.
 
 On Windows, standalone Chromium is discovered in the standard machine-wide
 locations under `C:\Program Files` and `C:\Program Files (x86)`, plus the
@@ -36,7 +36,7 @@ This method launches your browser automatically and extracts cookies after you l
 
 ### Prerequisites
 
-- A supported browser installed (Chrome, Arc, Dia, Brave, Edge, Chromium, Firefox, Vivaldi, or Opera)
+- A supported browser installed (Chrome, Arc, Dia, Brave, Edge, Edge Beta, Chromium, Firefox, Vivaldi, or Opera)
 - Chromium-family browsers should be **completely closed** before running
 
 ### Steps
@@ -46,17 +46,20 @@ This method launches your browser automatically and extracts cookies after you l
 
 # 2. Run the auth command (CLI or standalone)
 nlm login                      # Recommended
+#    New profile? It first asks: Protected (OS keystore, recommended) or Plain file.
+#    See "Choosing at first login" under Protected Storage below.
 
 # 3. Log in to your Google account in the browser window that opens
+#    (Ctrl+C cancels cleanly: nothing is saved and the browser window is closed)
 
-# 4. Wait for "SUCCESS!" message
+# 4. Wait for "Successfully authenticated!"
 ```
 
-If your DevTools endpoint is slow to respond, you can increase the timeout:
-
-```bash
-nlm login --devtools-timeout 15
-```
+Chromium/CDP login waits up to 300 seconds for sign-in. A page at
+`notebook.google.com`, an HTTP 200 response, or an anonymous `NID` cookie does
+not prove authentication. Login waits for signed-in Google cookies and the
+app's CSRF token before saving credentials or reporting success. A timeout
+does not save anonymous credentials or replace an existing saved login.
 
 ### What Happens Behind the Scenes
 
@@ -64,8 +67,23 @@ nlm login --devtools-timeout 15
 2. A dedicated browser profile is created for authentication
 3. The browser launches with the appropriate automation backend
 4. You log in to Gemini Notebook via the browser
-5. Cookies are extracted and cached; CSRF/session fields are refreshed automatically when needed
-6. The browser is closed automatically
+5. Signed-in cookies and the CSRF token are extracted and cached; session fields are refreshed automatically when needed
+6. Builtin login closes the browser it launched after successful extraction. Externally managed CDP browsers remain open.
+
+### Recovering a Saved Session
+
+If authentication has expired, retry login with the same profile, then check it:
+
+```bash
+nlm login --profile work
+nlm login --check --profile work
+```
+
+In v0.15.3 and later, an anonymous session saved by an older version no longer
+passes validation and blocks browser login. Upgrade first if an older version
+reports success with only `NID` and no CSRF token. Profile deletion is not the
+first recovery step. If a check is inconclusive because of a timeout or network
+failure, check connectivity or try a read-only API call before re-authenticating.
 
 When Firefox is selected, the profile is isolated under the NLM storage directory and its cookie database is read directly. Because cookie extraction cannot prove which Google account is active, re-login against an existing saved profile requires explicit `nlm login --force` after you confirm the account.
 
@@ -80,7 +98,7 @@ nlm config set auth.browser brave
 # Or use an environment variable
 export NLM_BROWSER=arc
 
-# Valid values: auto, chrome, arc, brave, edge, chromium, firefox, vivaldi, opera
+# Valid values: auto, chrome, arc, brave, edge, edge-beta, chromium, firefox, vivaldi, opera
 # If the preferred browser is not installed, falls back to auto-detection.
 ```
 
@@ -123,6 +141,10 @@ nlm login profile rename work company
 nlm login profile delete old-profile
 ```
 
+### Switching accounts from an MCP app (no CLI needed)
+
+AI apps that only have the MCP (for example Claude CoWork) can use the `profile` tool: list your saved accounts, switch for the current session, and optionally make a profile your saved default (`make_default=true`). A session switch lasts until the MCP server restarts. Apps like Claude Desktop share one MCP server across chats, so a switch can show up in other open chats until you quit and reopen the app. While a switch is active, every tool result names the account in use.
+
 ### How Multi-Profile Works
 
 Each profile gets:
@@ -135,6 +157,17 @@ This means you can stay logged into multiple Google accounts simultaneously with
 
 ---
 
+## Automatic Recovery
+
+Automatic browser recovery is limited per profile within each process:
+`NOTEBOOKLM_AUTH_RECOVERY_COOLDOWN_SECONDS` defaults to 900 seconds and
+`NOTEBOOKLM_AUTH_MAX_HEADLESS_FAILURES` defaults to 3 failed attempts.
+Set either value to 0 to disable that limit. A changed credential revision
+(or changed cookies in file mode) resets the budget; success clears its failure count. Concurrent requests share
+an active recovery and wait up to 60 seconds for its result instead of consuming
+another attempt. Explicit CLI and MCP refresh commands bypass this budget.
+These limits are not a durable policy across separate processes.
+
 ## Unattended / Scheduled Refresh
 
 A logged-in session normally self-heals: when the short-lived cookies age out,
@@ -145,6 +178,7 @@ you can also refresh proactively so a session never lapses between jobs:
 ```bash
 nlm auth refresh                 # Refresh the default profile
 nlm auth refresh --profile work  # Refresh a named profile
+nlm auth refresh --http-only     # Validate and save an HTTP-only refresh
 ```
 
 `nlm auth refresh` runs a headless browser against the saved profile — no
@@ -158,6 +192,21 @@ fails, so a scheduler can react. Example launchd/cron keep-alive (every 30 min):
 > **Note:** This needs a saved Chrome profile (from a prior `nlm login`). It
 > does not help when `NOTEBOOKLM_COOKIES` is set as an environment variable —
 > that value overrides saved credentials, so update it directly instead.
+>
+> In v0.15.4 and later, `nlm auth refresh` provides descriptive, actionable diagnostics
+> indicating whether the saved profile was missing, signed out, encountered a DevTools websocket
+> error, timed out loading NotebookLM, or had its extracted credentials rejected by the API.
+> In addition, headless authentication automatically falls back to an OS-assigned ephemeral
+> port if default DevTools ports (e.g. 9222/9223) are occupied or conflict.
+
+> **Disabling the refresh:** Some Google Workspace accounts have their session
+> revoked server-side whenever the saved browser profile is relaunched (issue
+> #330). Set `NOTEBOOKLM_DISABLE_HEADLESS_REFRESH=1` to turn off both the
+> automatic browser self-heal and browser-based `nlm auth refresh` on those accounts.
+> `nlm auth refresh --http-only` remains available: it forces HTTP transport even
+> when `NOTEBOOKLM_RPC_TRANSPORT=cdp` is configured. It saves candidates only
+> after a valid authenticated API response. It cannot renew browser-dependent
+> PSIDTS cookies or revive a fully expired login.
 
 ---
 
@@ -268,6 +317,159 @@ SID=abc123...; HSID=xyz789...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID
 
 ---
 
+---
+
+<a id="protected-storage"></a>
+## Protected Storage (Protected Mode)
+
+> 🔒 **New: Protected login storage (recommended)**
+> Your saved Google login can now be encrypted, with its key kept in your computer's keychain instead of a plain file. We highly recommend everyone switch on a personal computer:
+>
+>     nlm auth storage set protected
+>
+> Optional: nothing changes unless you turn it on. Servers, cron, Docker and SSH setups can keep the plain file.
+> [How it works](#protected-storage)
+
+### Overview
+
+By default, `notebooklm-mcp-cli` stores login cookies in readable JSON files (`file` mode) with `0600` permissions.
+
+In **Protected mode**, your cookies and session tokens are encrypted on disk with AES-256-GCM (`credentials.enc`). The encryption key is generated uniquely for your computer and stored in your operating system's native keystore:
+- **macOS:** macOS Keychain
+- **Windows:** Windows Credential Manager
+- **Linux:** SecretService API (GNOME Keyring, KWallet)
+
+Protected mode is **optional**. File mode remains the default, and upgrading `notebooklm-mcp-cli` changes nothing until you explicitly choose to enable it.
+
+### Choosing at first login
+
+When you log in with a **new** profile in a terminal on a desktop computer, `nlm login` asks before the browser opens:
+
+```
+Where should your saved login live?
+  1) Protected - encrypted, key kept in your OS keystore (recommended)
+  2) Plain file - simple, readable by anything on this computer
+```
+
+Protected mode only accepts names made of letters, numbers, `-`, `_` and `.`. If you type something else (for example `my work` or `john@work.com`), the question offers a working name such as `my-work` and also lets you keep your name as a plain file. Choosing protected means the login is encrypted from the start and you will not be asked or reminded again. Choosing plain is respected too. Skip the question in scripts with `nlm login --storage protected` (or `--storage file`). Existing profiles keep their current mode; change it later with `nlm setup` (the "Credential protection" menu item) or `nlm auth storage set`.
+
+### Commands
+
+Manage credential storage using the `nlm auth storage` subcommands:
+
+```bash
+# Check current storage status for the default profile
+nlm auth storage status
+
+# Check a named profile
+nlm auth storage status --profile work
+
+# Switch to Protected mode (encrypts credentials, removes plain files)
+nlm auth storage set protected
+nlm auth storage set protected --profile work
+
+# Switch back to File mode (decrypts credentials, restores readable JSON)
+nlm auth storage set file
+nlm auth storage set file --profile work
+
+# Output status or results as JSON
+nlm auth storage status --json
+nlm auth storage set protected --json
+```
+
+### Conflict Resolution
+
+If a profile has both plain-file credentials and encrypted credentials that differ (for example, if you logged in separately in both modes), `nlm` flags a conflict and asks you to resolve it:
+
+```bash
+# Keep the plain-file login and delete the encrypted leftover (stays in file mode)
+nlm auth storage resolve file --profile work
+
+# Keep the encrypted login and delete the plain files (switches to Protected mode)
+nlm auth storage resolve protected --profile work
+
+# Discard damaged or inaccessible credentials when the key is lost
+nlm auth storage resolve file --profile work --discard-inaccessible --yes
+
+# Clear a stuck or corrupt progress marker from an interrupted operation
+nlm auth storage resolve --profile work --clear-marker --yes
+```
+
+- `resolve file`: Keeps your current plain-file login, deletes the encrypted leftover, and stays in file mode.
+- `resolve protected`: Keeps the encrypted login, deletes the plain files, and switches to Protected mode.
+- `--discard-inaccessible`: Use only when the encryption key was deleted from the OS keystore or the ciphertext file is corrupted beyond recovery. It removes the inaccessible ciphertext and resets the profile to file mode so you can log in again.
+- `--clear-marker`: Clears a stuck or corrupt operation marker left behind if a migration was interrupted by a crash or power loss, provided the quarantine directory is clean.
+
+### Relocating or Copying Storage
+
+If you move your `~/.notebooklm-mcp-cli` directory to a new location on the same machine (e.g. changing your home directory path), update the installation identity:
+
+```bash
+nlm auth storage relocate
+```
+
+**Why a copied folder refuses:** Protected mode relies on your computer's OS keystore. If you copy `~/.notebooklm-mcp-cli` to a different machine, the new computer does not have the hardware-backed encryption key in its keystore. The profile safely refuses to open rather than crashing. To use Gemini Notebook on a new computer, sign in directly with `nlm login`.
+
+### Downgrade Preparation
+
+> [!WARNING]
+> Older versions of `notebooklm-mcp-cli` do not understand `credentials.enc`. Before downgrading or installing an older version of the CLI, convert every protected profile back to file mode:
+>
+>     nlm auth storage set file
+>     nlm auth storage set file --profile <name>
+
+### Exporting Plain Credentials
+
+If you need plain-text JSON credentials back (for example, to inspect them or use them with scripts that read `auth.json` or `cookies.json`), run:
+
+```bash
+nlm auth storage set file --profile <name>
+```
+
+This decrypts the credentials and writes readable JSON files with `0600` permissions.
+
+### macOS "Always Allow" Prompt
+
+Usually, no prompt appears during normal terminal operations. However, macOS prompts for permission when a different Python binary attempts to read an item created by another binary:
+
+1. **Desktop extension users**: the Claude Desktop extension uses `python3` from `PATH` only to run a small launcher (`run_server.py`), which then starts the server with `uvx --from notebooklm-mcp-cli notebooklm-mcp`. `uvx` runs the server in its own environment, separate from `uv tool install`, and may pick a different Python build. If that Python differs from the one that created the key (for example, you enabled Protected mode from the `uv tool` install of `nlm`), macOS shows the Keychain access prompt once when the extension first reads it. Click **Always Allow** (not "Allow").
+2. **Python upgrades**: If you upgrade Python (such as when Homebrew or `uv` installs a new Python release with a different binary path or signature), macOS detects the new binary signature and displays the prompt once more. Click **Always Allow** again.
+3. Once **Always Allow** is clicked for each binary, macOS silently grants access for all future operations, MCP tool calls, and background token refreshes.
+
+The prompt asks for your **Mac login password**: type it, then click **Always Allow**. If nobody answers within 60 seconds, `nlm` stops waiting and reports "approve the Keychain popup and retry", but the popup stays on screen. Dismiss it, rerun the command, and approve the new prompt.
+
+### Where Protected Mode Cannot Work
+
+Protected mode requires an active, interactive desktop session with an unlocked OS keystore. Remote and headless sessions cannot use the OS keystore (Keychain on macOS, Credential Manager on Windows). Specifically, it cannot work in:
+- **Headless Linux servers, Docker containers, or cron jobs** without a D-Bus session bus.
+- **Windows SSH sessions, Windows services, or Scheduled Tasks** set to "Run whether user is logged on or not" (Windows error 1312: Windows Credential Manager requires an interactive logon session).
+- **macOS over SSH sessions** or prior to user login after a reboot (the macOS Keychain is locked or unavailable over remote SSH sessions).
+
+If you run `nlm auth storage set protected` in an unsupported environment, it safely refuses with a clear error message:
+> *Cannot enable protected mode: OS credential store is unavailable or locked.*
+> *Remote/SSH sessions can't use the OS keystore (Keychain on macOS, Credential Manager on Windows). Run this from the desktop, or keep this profile in file mode. Your current setup keeps working.*
+
+Your existing setup continues working in file mode. Keep automated, remote, and server profiles in file mode.
+
+### Scheduled Refresh
+
+User-configured scheduler jobs (`launchd`, `cron`, Windows Task Scheduler running `nlm auth refresh`) are the user's responsibility:
+- In Protected mode, scheduled refresh only works while the user is logged into the OS desktop session with an unlocked keystore.
+- Scheduled jobs running in headless environments, before login, or over SSH fail with a clear error unless the profile is kept in file mode.
+- In-process token refresh and rotation (within an active CLI session or running MCP server process) is completely unaffected: it runs in the same Python process and requires no OS prompts.
+
+### Threat Model
+
+- **What it protects against:** Backups, cloud sync folders (Dropbox, iCloud, Google Drive), accidental sharing of repository or storage directories, and other tools or scripts that read files from disk.
+- **What it does NOT protect against:** Other code running as your user account on the same computer (any process running under your user session can request the key from the OS keystore).
+- **Other credential surfaces:** Protected mode secures `notebooklm-mcp-cli`'s stored credentials. It does not alter browser profiles (`chrome-profiles/`, Firefox SQLite databases), manual `cookies.txt` exports left on disk, `NOTEBOOKLM_COOKIES` environment variables in shell configs, legacy `~/.notebooklm-mcp/auth.json` files, or authenticated debug artifacts (`debug_page.html`).
+
+### Environment Override (`NLM_AUTH_STORAGE`)
+
+You can temporarily force the storage mode for testing using the `NLM_AUTH_STORAGE` environment variable (`file` or `protected`). If `NLM_AUTH_STORAGE` disagrees with the on-disk profile setting, mutating commands (`set` and `resolve`) refuse with an error until the variable is unset.
+
+---
+
 ## Where Tokens Are Stored
 
 All data is stored under `~/.notebooklm-mcp-cli/`:
@@ -276,26 +478,30 @@ All data is stored under `~/.notebooklm-mcp-cli/`:
 ~/.notebooklm-mcp-cli/
 ├── config.toml                    # CLI configuration
 ├── aliases.json                   # Notebook aliases
+├── installation.json              # Installation identity
+├── locks/                         # Inter-process profile locks
+├── operations/                    # Migration state & quarantine markers
 ├── profiles/                      # Authentication profiles
 │   ├── default/
-│   │   └── auth.json              # Cookies, tokens, email
+│   │   ├── metadata.json          # Email, host, timestamps, storage mode
+│   │   ├── credentials.enc        # Encrypted cookies & tokens (Protected mode)
+│   │   └── cookies.json           # Plaintext cookies (File mode only)
 │   ├── work/
-│   │   └── auth.json
+│   │   ├── metadata.json
+│   │   └── credentials.enc
 │   └── personal/
-│       └── auth.json
+│       ├── metadata.json
+│       └── cookies.json
+├── auth.json                      # Root mirror of default profile (File mode only)
 ├── chrome-profile/                # Chrome profile (single-profile users)
 └── chrome-profiles/               # Chrome profiles (multi-profile users)
     ├── work/
     └── personal/
 ```
 
-Each profile's `auth.json` contains:
-
-- Parsed cookies
-- CSRF token (auto-extracted)
-- Session ID (auto-extracted)
-- Account email (auto-extracted)
-- Extraction timestamp
+- In **Protected mode**, credentials live in `credentials.enc`. No plaintext cookies or `auth.json` files exist on disk.
+- In **File mode**, credentials live in `cookies.json` (and the configured default profile is mirrored to root `auth.json` for backwards compatibility with external scripts), secured with `0600` permissions.
+- In both modes, `metadata.json` stores non-secret profile metadata (account email, base host, build label, and storage mode setting).
 
 ---
 
@@ -402,13 +608,13 @@ Make sure you copied the cookie **value**, not the header name. The value should
 
 If you keep getting "Authentication expired" even after running `nlm login` or calling `refresh_auth`, check whether `NOTEBOOKLM_COOKIES` is set as an environment variable in your MCP config.
 
-**Why this happens:** When `NOTEBOOKLM_COOKIES` is set in your config (e.g. `claude_desktop_config.json`), it takes absolute priority over all other auth sources — `auth.json`, profile cookies, `save_auth_tokens`, and `nlm login`. When those hardcoded cookies expire, no recovery action can fix a running MCP process because the stale env var is baked into its environment.
+**Why this happens:** When `NOTEBOOKLM_COOKIES` is set in your config (e.g. `claude_desktop_config.json`), it takes priority over default auth sources — `auth.json`, profile cookies, `save_auth_tokens`, and `nlm login`. An explicit CLI `--profile` or MCP `usage_get(profile="work")` uses that saved account instead. When those hardcoded cookies expire, no recovery action can fix a running MCP process because the stale env var is baked into its environment.
 
 **How to check:**
 
 ```python
 import os
-print("NOTEBOOKLM_COOKIES in env:", "YES (overrides everything!)" if os.environ.get("NOTEBOOKLM_COOKIES") else "no")
+print("NOTEBOOKLM_COOKIES in env:", "YES (used when no explicit profile is selected)" if os.environ.get("NOTEBOOKLM_COOKIES") else "no")
 ```
 
 **How to fix (pick one):**

@@ -25,6 +25,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from notebooklm_tools.core import auth as _core_auth
@@ -48,9 +49,11 @@ __all__ = [
     "confirm_auth_via_api",
     "credentials_are_usable",
     "diagnose_auth_replay",
+    "ensure_profile_ready",
     "get_active_auth_mtime",
     "get_auth_health_checker",
     "get_cache_path",
+    "get_notebook_count",
     "load_cached_tokens",
     "save_tokens_to_cache",
     "validate_cookies",
@@ -72,6 +75,11 @@ def check_auth(*args, **kwargs):
     return _core_auth.check_auth(*args, **kwargs)
 
 
+def ensure_profile_ready(profile_name: str | None = None) -> None:
+    """Re-export of `notebooklm_tools.core.auth.ensure_profile_ready`."""
+    _core_auth.ensure_profile_ready(profile_name=profile_name)
+
+
 def load_cached_tokens(profile_name: str | None = None):
     """Re-export of `notebooklm_tools.core.auth.load_cached_tokens`."""
     if profile_name is None:
@@ -83,20 +91,25 @@ def save_tokens_to_cache(
     tokens,
     silent: bool = False,
     profile_name: str | None = None,
-    email: str | None = None,
+    expected_revision: str | None = None,
+    force: bool = True,
 ):
     """Re-export of `notebooklm_tools.core.auth.save_tokens_to_cache`."""
-    if profile_name is None and email is None:
-        return _core_auth.save_tokens_to_cache(tokens, silent=silent)
-    return _core_auth.save_tokens_to_cache(
-        tokens,
-        silent=silent,
-        profile_name=profile_name,
-        email=email,
-    )
+    kwargs: dict[str, Any] = {}
+    if profile_name is not None:
+        kwargs["profile_name"] = profile_name
+    if expected_revision is not None:
+        kwargs["expected_revision"] = expected_revision
+    kwargs["force"] = force
+    try:
+        return _core_auth.save_tokens_to_cache(tokens, silent=silent, **kwargs)
+    except TypeError:
+        kwargs.pop("force", None)
+        kwargs.pop("expected_revision", None)
+        return _core_auth.save_tokens_to_cache(tokens, silent=silent, **kwargs)
 
 
-def get_cache_path():
+def get_cache_path() -> Path:
     """Re-export of `notebooklm_tools.core.auth.get_cache_path`."""
     return _core_auth.get_cache_path()
 
@@ -152,6 +165,34 @@ def get_active_auth_mtime() -> float:
         return latest
     except Exception:
         return 0.0
+
+
+def get_active_auth_state(profile: str | None = None) -> Any:
+    """Return an invalidation state token for active auth storage.
+
+    In protected mode, returns (profile_name, 'protected', revision) where revision
+    is read from credentials.enc, guaranteeing that rapid writes within a single
+    filesystem mtime tick invalidate the cache.
+    In file mode, returns (profile_name, 'file', mtime) or the float mtime,
+    preserving main's exact behavior.
+    """
+    try:
+        from notebooklm_tools.core.credential_store import get_envelope_revision
+        from notebooklm_tools.utils.config import (
+            get_auth_storage_mode,
+            get_config,
+            get_profile_dir,
+        )
+
+        prof = (profile or get_config().auth.default_profile).strip()
+        mode = get_auth_storage_mode(prof)
+        if mode == "protected":
+            enc_file = get_profile_dir(prof, create=False) / "credentials.enc"
+            rev = get_envelope_revision(enc_file) if enc_file.exists() else None
+            return (prof, "protected", rev)
+        return (prof, "file", get_active_auth_mtime())
+    except Exception:
+        return (profile or "default", "unknown", 0.0)
 
 
 # Lazy-re-exported core classes. The shim does NOT cache these in module
@@ -243,6 +284,7 @@ class AuthHealthChecker:
         self._report: AuthHealthReport | None = None
         self._cache_ts: float = 0.0
         self._auth_mtime: float = 0.0
+        self._auth_state: Any = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -263,14 +305,15 @@ class AuthHealthChecker:
         if not force and self._report is not None:
             age = now - self._cache_ts
             if age < self.CACHE_TTL:
-                current_mtime = get_active_auth_mtime()
-                if current_mtime == self._auth_mtime:
+                current_state = get_active_auth_state(self._profile)
+                if current_state == self._auth_state:
                     return replace(self._report, cached=True)
 
         report = self._run_checks(timeout=timeout)
 
         self._report = report
         self._cache_ts = now
+        self._auth_state = get_active_auth_state(self._profile)
         self._auth_mtime = get_active_auth_mtime()
         return report
 
@@ -278,6 +321,8 @@ class AuthHealthChecker:
         """Force the next ``check()`` call to re-run all probes."""
         self._report = None
         self._cache_ts = 0.0
+        self._auth_state = None
+        self._auth_mtime = 0.0
 
     # ------------------------------------------------------------------
     # Probe orchestration
@@ -444,6 +489,8 @@ class AuthHealthChecker:
                 return False, f"http_{resp.status_code}", None, resp.status_code
 
             csrf = _core_auth.extract_csrf_from_page_source(resp.text) or ""
+            if not csrf:
+                return False, "expired", final_url, resp.status_code
             return True, None, csrf, resp.status_code
 
         except Exception as e:
@@ -582,6 +629,65 @@ class AuthHealthChecker:
 # ---------------------------------------------------------------------------
 
 
+_notebook_count_cache: dict[str | None, tuple[float, int]] = {}
+_count_cache_lock = threading.Lock()
+_COUNT_CACHE_TTL = 10.0  # seconds
+
+
+def _record_confirmed_notebook_count(profile: str | None, count: int) -> None:
+    if not isinstance(profile, str) or not profile.strip():
+        return
+    now = time.monotonic()
+    key = profile.strip()
+    with _count_cache_lock:
+        _notebook_count_cache[key] = (now, count)
+
+
+def _get_confirmed_notebook_count(profile: str | None) -> int | None:
+    if not isinstance(profile, str) or not profile.strip():
+        return None
+    now = time.monotonic()
+    key = profile.strip()
+    with _count_cache_lock:
+        entry = _notebook_count_cache.get(key)
+        if entry is not None:
+            ts, count = entry
+            if now - ts <= _COUNT_CACHE_TTL:
+                return count
+            del _notebook_count_cache[key]
+    return None
+
+
+def get_notebook_count(profile: Any) -> int | None:
+    """Return a best-effort count without hiding an API authentication rejection."""
+    profile_name = getattr(profile, "name", None)
+    cached = _get_confirmed_notebook_count(profile_name)
+    if cached is not None:
+        return cached
+
+    from notebooklm_tools.core.client import NotebookLMClient
+    from notebooklm_tools.core.errors import ClientAuthenticationError
+    from notebooklm_tools.core.exceptions import AuthenticationError
+    from notebooklm_tools.services.errors import ServiceError
+
+    try:
+        with NotebookLMClient(
+            cookies=profile.cookies,
+            csrf_token=profile.csrf_token or "",
+            session_id=profile.session_id or "",
+            build_label=profile.build_label or "",
+            base_host=profile.base_host or "",
+            profile_name=profile_name,
+        ) as client:
+            count = len(client.list_notebooks())
+            _record_confirmed_notebook_count(profile_name, count)
+            return count
+    except (AuthenticationError, ClientAuthenticationError) as exc:
+        raise ServiceError("Credentials have expired.", category="authentication") from exc
+    except Exception:
+        return None
+
+
 def confirm_auth_via_api(profile: str | None = None) -> tuple[bool, str | None]:
     """Confirm credentials with a live NotebookLM API call.
 
@@ -595,6 +701,12 @@ def confirm_auth_via_api(profile: str | None = None) -> tuple[bool, str | None]:
 
     from notebooklm_tools.core.auth import AuthManager
     from notebooklm_tools.core.client import NotebookLMClient
+    from notebooklm_tools.core.errors import (
+        ClientAuthenticationError,
+        RPCError,
+        TransientBackendError,
+    )
+    from notebooklm_tools.core.exceptions import AuthenticationError
 
     manager = AuthManager(profile)
     if not manager.profile_exists():
@@ -609,11 +721,48 @@ def confirm_auth_via_api(profile: str | None = None) -> tuple[bool, str | None]:
             build_label=p.build_label or "",
             base_host=p.base_host or "",
             profile_name=profile,
+            auth_revision=p.revision,
+            is_env_auth=False,
         ) as client:
-            client.list_notebooks()
+            notebooks = client.list_notebooks()
+            _record_confirmed_notebook_count(profile, len(notebooks))
         return True, None
+    except (ClientAuthenticationError, AuthenticationError) as exc:
+        return False, f"auth_expired: {type(exc).__name__}: {exc}"
+    except RPCError as exc:
+        if exc.error_code in (7, 16):
+            return False, f"auth_expired: RPCError({exc.error_code}): {exc}"
+        return False, f"network_error: RPCError({exc.error_code}): {exc}"
+    except TransientBackendError as exc:
+        return False, f"network_error: TransientBackendError: {exc}"
     except Exception as exc:
-        return False, str(exc)
+        import httpx as _httpx
+
+        if isinstance(exc, _httpx.HTTPStatusError):
+            if exc.response.status_code in (401, 403):
+                return False, f"auth_expired: HTTPStatusError: {exc.response.status_code}"
+            return False, f"network_error: HTTPStatusError: {exc.response.status_code}"
+        if isinstance(exc, (_httpx.TimeoutException, _httpx.RequestError)):
+            return False, f"network_error: {type(exc).__name__}: {exc}"
+        return False, f"network_error: {type(exc).__name__}: {exc}"
+
+
+def _is_auth_rejection(err: str | None) -> bool:
+    if not err:
+        return False
+    if err.startswith("network_error:"):
+        return False
+    lower = err.lower()
+    return (
+        lower.startswith("auth_expired:")
+        or "clientauthenticationerror" in lower
+        or "authenticationerror" in lower
+        or "expired" in lower
+        or "unauthenticated" in lower
+        or "permission_denied" in lower
+        or "401" in lower
+        or "403" in lower
+    )
 
 
 def credentials_are_usable(
@@ -629,13 +778,20 @@ def credentials_are_usable(
     """
     report = get_auth_health_checker(profile=profile).check(force=force)
     if report.status == "configured":
-        return True, report.status, None
+        if not force:
+            return True, report.status, None
+        ok, err = confirm_auth_via_api(profile=report.profile)
+        if ok:
+            return True, "configured", None
+        status = "stale" if _is_auth_rejection(err) else "unverified"
+        return False, status, err
 
     if report.status in ("stale", "unverified"):
         ok, err = confirm_auth_via_api(profile=report.profile)
         if ok:
             return True, "configured", None
-        return False, report.status, err
+        status = "stale" if _is_auth_rejection(err) else "unverified"
+        return False, status, err
 
     detail = next((p.error for p in report.probes if p.error), None)
     return False, report.status, detail
@@ -646,12 +802,12 @@ _checker_lock = threading.Lock()
 
 
 def get_auth_health_checker(profile: str | None = None) -> AuthHealthChecker:
-    """Return a process-wide AuthHealthChecker scoped to one auth profile.
+    """Return the cached AuthHealthChecker for one auth profile.
 
-    Calls that omit ``profile`` retain the historical process-wide checker
-    for the configured default profile. Explicit profiles receive independent
-    cached health state so one process can validate multiple NotebookLM
-    identities without switching global configuration.
+    Calls that omit ``profile`` retain the historical shared checker for the
+    configured default profile. Explicit profile names receive independent
+    cached health state so one process can validate multiple saved accounts
+    without switching global configuration.
     """
     key = profile.strip() if isinstance(profile, str) and profile.strip() else None
     checker = _checkers.get(key)

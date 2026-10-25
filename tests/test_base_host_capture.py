@@ -8,16 +8,59 @@ browser actually landed on so later API calls target the same host
 
 from unittest.mock import patch
 
+from notebooklm_tools.core.auth import AuthTokens
 from notebooklm_tools.utils import cdp
 
 
+class TestValidateHeadlessCandidate:
+    def test_valid_candidate_uses_side_effect_free_client(self):
+        tokens = AuthTokens(
+            cookies={"SID": "fresh"},
+            csrf_token="csrf",
+            session_id="sid",
+            build_label="bl",
+            base_host="notebook.google.com",
+        )
+
+        with patch("notebooklm_tools.core.client.NotebookLMClient") as mock_client:
+            client = mock_client.return_value.__enter__.return_value
+            client.list_notebooks.return_value = []
+
+            assert cdp._validate_headless_candidate(tokens, "work") is True
+
+        mock_client.assert_called_once_with(
+            cookies=tokens.cookies,
+            csrf_token="csrf",
+            session_id="sid",
+            build_label="bl",
+            base_host="notebook.google.com",
+            profile_name="work",
+            is_env_auth=True,
+        )
+        client.list_notebooks.assert_called_once_with(require_valid_response=True)
+
+    def test_invalid_candidate_is_rejected(self):
+        tokens = AuthTokens(cookies={"SID": "fresh"}, csrf_token="csrf")
+
+        with patch("notebooklm_tools.core.client.NotebookLMClient") as mock_client:
+            client = mock_client.return_value.__enter__.return_value
+            client.list_notebooks.side_effect = RuntimeError("unauthenticated")
+
+            assert cdp._validate_headless_candidate(tokens, "work") is False
+
+
 class TestRunHeadlessAuthCapturesBaseHost:
-    def _run_with_current_url(self, current_url: str, profile_name: str = "default"):
+    def _run_with_current_url(
+        self,
+        current_url: str,
+        profile_name: str = "default",
+        valid_candidate: bool = True,
+    ):
         with (
             patch.object(cdp, "has_chrome_profile", return_value=True),
             patch.object(
                 cdp, "find_existing_nlm_chrome", return_value=(9223, "ws://127.0.0.1:9223")
-            ),
+            ) as mock_find_existing,
             patch.object(
                 cdp,
                 "find_or_create_notebooklm_page",
@@ -37,11 +80,25 @@ class TestRunHeadlessAuthCapturesBaseHost:
             ),
             patch.object(cdp, "extract_csrf_token", return_value="csrf"),
             patch.object(cdp, "extract_session_id", return_value="sid"),
-            patch.object(cdp, "extract_email", return_value="user@example.com"),
+            patch.object(
+                cdp,
+                "_validate_headless_candidate",
+                return_value=valid_candidate,
+            ),
             patch.object(cdp, "cleanup_chrome_profile_cache", return_value=0),
+            patch.object(
+                cdp,
+                "_validate_headless_candidate",
+                return_value=valid_candidate,
+                create=True,
+            ),
             patch("notebooklm_tools.core.auth.save_tokens_to_cache") as mock_save,
         ):
             tokens = cdp.run_headless_auth(profile_name=profile_name)
+            mock_find_existing.assert_called_once_with(
+                profile_name=profile_name,
+                include_headless=True,
+            )
             return tokens, mock_save
 
     def test_base_host_captured_on_rebrand_host(self):
@@ -57,11 +114,11 @@ class TestRunHeadlessAuthCapturesBaseHost:
     def test_headless_refresh_saves_to_requested_profile(self):
         tokens, mock_save = self._run_with_current_url("https://notebook.google.com/")
         assert tokens is not None
-        mock_save.assert_called_once_with(
-            tokens,
-            profile_name="default",
-            email="user@example.com",
-        )
+        mock_save.assert_called_once()
+        assert mock_save.call_args.args == (tokens,)
+        assert mock_save.call_args.kwargs["profile_name"] == "default"
+        assert mock_save.call_args.kwargs["force"] is False
+        assert isinstance(mock_save.call_args.kwargs["expected_file_fingerprint"], str)
 
     def test_named_profile_is_preserved_when_tokens_are_cached(self):
         tokens, mock_save = self._run_with_current_url(
@@ -69,8 +126,18 @@ class TestRunHeadlessAuthCapturesBaseHost:
             profile_name="tsm",
         )
 
-        mock_save.assert_called_once_with(
-            tokens,
-            profile_name="tsm",
-            email="user@example.com",
+        mock_save.assert_called_once()
+        assert mock_save.call_args.args == (tokens,)
+        assert mock_save.call_args.kwargs["profile_name"] == "tsm"
+        assert mock_save.call_args.kwargs["force"] is False
+        assert isinstance(mock_save.call_args.kwargs["expected_file_fingerprint"], str)
+
+    def test_rpc_invalid_candidate_is_not_cached_or_returned(self):
+        tokens, mock_save = self._run_with_current_url(
+            "https://notebook.google.com/",
+            profile_name="work",
+            valid_candidate=False,
         )
+
+        assert tokens is None
+        mock_save.assert_not_called()

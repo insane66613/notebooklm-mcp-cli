@@ -103,8 +103,8 @@ def test_get_source_guide_uses_call_rpc():
             assert result == {"summary": "", "keywords": []}
 
 
-def _drive_pdf_metadata():
-    """Metadata shape captured from a PDF added through the web UI Drive picker."""
+def _drive_pdf_metadata(mime_type="application/pdf", drive_id="drive-file-id"):
+    """Metadata shape captured from a file added through the web UI Drive picker."""
     return [
         None,
         33405,
@@ -115,7 +115,7 @@ def _drive_pdf_metadata():
         None,
         None,
         69367,
-        ["drive-file-id", 4, "application/pdf", ""],
+        [drive_id, 4, mime_type, ""],
         None,
         "document.pdf",
         None,
@@ -147,6 +147,131 @@ def test_get_notebook_sources_identifies_drive_picker_pdf_by_mime_type():
 
     assert sources[0]["source_type"] == 14
     assert sources[0]["source_type_name"] == "pdf"
+
+
+@pytest.mark.parametrize(
+    "mime_type",
+    [
+        "application/pdf",
+        "text/plain",
+        "text/markdown",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ],
+)
+def test_get_notebook_sources_marks_drive_linked_type_14_files_syncable(mime_type):
+    from notebooklm_tools.core.sources import SourceMixin
+
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[
+            [
+                "Notebook",
+                [[["source-1"], "drive-file", _drive_pdf_metadata(mime_type), [None, 2]]],
+                "notebook-1",
+            ]
+        ]
+    )
+
+    source = mixin.get_notebook_sources_with_types("notebook-1")[0]
+
+    assert source["drive_doc_id"] == "drive-file-id"
+    assert source["can_sync"] is True
+
+
+def test_service_drive_listing_includes_drive_picker_file():
+    from notebooklm_tools.core.sources import SourceMixin
+    from notebooklm_tools.services.sources import list_drive_sources
+
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[
+            [
+                "Notebook",
+                [[["source-1"], "drive-file.pdf", _drive_pdf_metadata(), [None, 2]]],
+                "notebook-1",
+            ]
+        ]
+    )
+    mixin.check_source_freshness = MagicMock(return_value=True)
+
+    result = list_drive_sources(mixin, "notebook-1")
+
+    assert result["drive_count"] == 1
+    assert result["stale_count"] == 0
+    assert result["drive_sources"][0]["id"] == "source-1"
+    assert result["drive_sources"][0]["drive_doc_id"] == "drive-file-id"
+    assert result["drive_sources"][0]["can_sync"] is True
+    mixin.check_source_freshness.assert_called_once_with("source-1")
+
+
+@pytest.mark.parametrize("source_type", [1, 2])
+def test_existing_drive_document_types_remain_syncable(source_type):
+    from notebooklm_tools.core.sources import SourceMixin
+
+    metadata = [
+        ["drive-document-id", "version-hash"],
+        None,
+        None,
+        None,
+        source_type,
+    ]
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[["Notebook", [[["source-1"], "Drive doc", metadata]], "notebook-1"]]
+    )
+
+    source = mixin.get_notebook_sources_with_types("notebook-1")[0]
+
+    assert source["drive_doc_id"] == "drive-document-id"
+    assert source["can_sync"] is True
+
+
+def test_type_14_without_drive_metadata_is_not_syncable():
+    from notebooklm_tools.core.sources import SourceMixin
+
+    metadata = _drive_pdf_metadata()[:9]
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[["Notebook", [[["source-1"], "uploaded.pdf", metadata]], "notebook-1"]]
+    )
+
+    source = mixin.get_notebook_sources_with_types("notebook-1")[0]
+
+    assert source["drive_doc_id"] is None
+    assert source["can_sync"] is False
+
+
+def test_non_drive_type_with_drive_metadata_is_not_syncable():
+    from notebooklm_tools.core.sources import SourceMixin
+
+    metadata = _drive_pdf_metadata()
+    metadata[4] = 5
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[["Notebook", [[["source-1"], "url", metadata]], "notebook-1"]]
+    )
+
+    source = mixin.get_notebook_sources_with_types("notebook-1")[0]
+
+    assert source["drive_doc_id"] is None
+    assert source["can_sync"] is False
+
+
+def test_accepted_pending_drive_file_is_reconciled_by_drive_metadata():
+    from notebooklm_tools.core.errors import RPCError
+    from notebooklm_tools.core.sources import SourceMixin
+
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin._call_rpc = MagicMock(side_effect=RPCError("accepted pending", error_code=3))
+    mixin.get_notebook_sources_with_types = MagicMock(
+        return_value=[{"id": "source-1", "title": "drive-file", "drive_doc_id": "drive-file-id"}]
+    )
+
+    with patch("notebooklm_tools.core.sources.time.sleep"):
+        result = mixin.add_drive_source("notebook-1", "drive-file-id", "drive-file")
+
+    assert result == {"id": "source-1", "title": "drive-file"}
 
 
 def test_get_source_fulltext_identifies_drive_picker_pdf_by_mime_type():
@@ -206,3 +331,71 @@ def test_wait_for_source_ready_allows_transient_unknown_audio_state():
     )
 
     assert result == ready
+
+
+def _youtube_metadata():
+    # Shape captured from a live get_source (hizoJc) response for a YouTube source.
+    # The URL slot at metadata[7] is empty; the URL is at metadata[5][0].
+    return [
+        None,
+        8553,
+        [1766850041, 63757000],
+        ["00000000-0000-0000-0000-000000000000", [1766850040, 782055000]],
+        9,
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ", "Example Channel"],
+        1,
+        None,
+        11169,
+    ]
+
+
+def _web_metadata():
+    return [
+        None,
+        1200,
+        [1766850041, 63757000],
+        ["00000000-0000-0000-0000-000000000000", [1766850040, 782055000]],
+        5,
+        None,
+        1,
+        ["https://example.com/article"],
+    ]
+
+
+def test_get_notebook_sources_returns_youtube_url_from_metadata_5():
+    from notebooklm_tools.core.sources import SourceMixin
+
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin.get_notebook = MagicMock(
+        return_value=[
+            [
+                "Notebook",
+                [
+                    [["source-1"], "Video", _youtube_metadata(), [None, 2]],
+                    [["source-2"], "Article", _web_metadata(), [None, 2]],
+                ],
+                "notebook-1",
+            ]
+        ]
+    )
+
+    sources = mixin.get_notebook_sources_with_types("notebook-1")
+
+    assert sources[0]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert sources[1]["url"] == "https://example.com/article"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (_youtube_metadata(), "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+        (_web_metadata(), "https://example.com/article"),
+    ],
+)
+def test_get_source_fulltext_returns_url(metadata, expected):
+    from notebooklm_tools.core.sources import SourceMixin
+
+    mixin = SourceMixin(cookies={"test": "cookie"}, csrf_token="test")
+    mixin._call_rpc = MagicMock(return_value=[[["source-1"], "Title", metadata], None, None, []])
+
+    assert mixin.get_source_fulltext("source-1")["url"] == expected

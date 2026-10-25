@@ -9,6 +9,7 @@ Internal API. See CLAUDE.md for full documentation.
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -298,6 +299,9 @@ class BaseClient:
     RPC_DELETE_STUDIO = "V5N4be"  # Delete Audio or Video Overview
     RPC_RENAME_ARTIFACT = "rc3d8d"  # Rename any studio artifact (Audio, Video, etc.)
     RPC_GET_INTERACTIVE_HTML = "v9rmvd"  # Fetch quiz/flashcard HTML content
+    RPC_GET_ARTIFACT = "v9rmvd"  # Get one artifact by id (same RPC; also reads element metadata)
+    RPC_SET_ARTIFACT_FIELDS = "rc3d8d"  # Update artifact fields via field mask (same RPC as rename)
+    RPC_START_ARTIFACT = "Rytqqe"  # Kick off generation of a (suggested) artifact
     RPC_REVISE_SLIDE_DECK = "KmcKPe"  # Revise existing slide deck with per-slide instructions
 
     # Mind map RPCs
@@ -360,6 +364,7 @@ class BaseClient:
     STUDIO_TYPE_SLIDE_DECK = constants.STUDIO_TYPE_SLIDE_DECK
     STUDIO_TYPE_DATA_TABLE = constants.STUDIO_TYPE_DATA_TABLE
     STUDIO_TYPE_DATA_TABLE_XLSX = constants.STUDIO_TYPE_DATA_TABLE_XLSX
+    STUDIO_TYPE_INTERACTIVE_REPORT = constants.STUDIO_TYPE_INTERACTIVE_REPORT
 
     # Audio formats and lengths
     AUDIO_FORMAT_DEEP_DIVE = constants.AUDIO_FORMAT_DEEP_DIVE
@@ -467,6 +472,9 @@ class BaseClient:
         profile_name: str | None = None,
         location: str | None = None,
         project_id: str | None = None,
+        auth_revision: str | None = None,
+        is_env_auth: bool | None = None,
+        rpc_transport: str | None = None,
     ):
         """
         Initialize the base client.
@@ -494,6 +502,12 @@ class BaseClient:
         self._bl = build_label
         self._base_host = base_host
         self._profile_name = profile_name
+        self._auth_revision = auth_revision
+        self._rpc_transport = rpc_transport
+        if is_env_auth is None:
+            self._is_env_auth = bool(os.environ.get("NOTEBOOKLM_COOKIES") and profile_name is None)
+        else:
+            self._is_env_auth = is_env_auth
         self._location = location or get_enterprise_location()
         self._enterprise_project_id = project_id or get_enterprise_project_id()
         if self._is_enterprise() and not self._enterprise_project_id:
@@ -874,6 +888,8 @@ class BaseClient:
         return present
 
     def _cdp_rpc_transport_enabled(self) -> bool:
+        if getattr(self, "_rpc_transport", None) is not None:
+            return self._rpc_transport == "cdp"
         from .cdp_transport import cdp_transport_enabled
 
         return cdp_transport_enabled()
@@ -984,6 +1000,8 @@ class BaseClient:
         _retry: bool = False,
         _deep_retry: bool = False,
         _server_retry: int = 0,
+        *,
+        retry_server_errors: bool = True,
     ) -> Any:
         """Execute an RPC call and return the extracted result.
 
@@ -991,6 +1009,10 @@ class BaseClient:
         1. Refresh CSRF/session tokens (fast, handles token expiry)
         2. Reload cookies from disk (handles external re-authentication)
         3. Run headless auth (auto-refresh if Chrome profile has saved login)
+
+        retry_server_errors: False disables the HTTP 5xx/429 replay. Use for
+        non-idempotent mutations whose delivery may have succeeded (e.g. the
+        Rytqqe kickoff).
         """
         if self._cdp_rpc_transport_enabled():
             return self._call_rpc_via_cdp(
@@ -1066,7 +1088,7 @@ class BaseClient:
             # Retry on transient server errors (5xx, 429) with exponential backoff.
             # Rate limits have a separate ceiling so external schedulers can own
             # retry policy without disabling safe connection or 5xx retries.
-            if is_retryable_error(e):
+            if retry_server_errors and is_retryable_error(e):
                 import time as _time
 
                 status = e.response.status_code
@@ -1087,6 +1109,7 @@ class BaseClient:
                         _retry,
                         _deep_retry,
                         _server_retry=_server_retry + 1,
+                        retry_server_errors=retry_server_errors,
                     )
                 # Exhausted retries, re-raise
                 raise
@@ -1130,6 +1153,7 @@ class BaseClient:
                     _retry,
                     _deep_retry,
                     _server_retry=_server_retry + 1,
+                    retry_server_errors=retry_server_errors,
                 )
             # Exhausted retries, re-raise
             raise
@@ -1157,6 +1181,7 @@ class BaseClient:
                     _retry,
                     _deep_retry,
                     _server_retry=_server_retry + 1,
+                    retry_server_errors=retry_server_errors,
                 )
             raise
 
@@ -1172,7 +1197,14 @@ class BaseClient:
                 self._refresh_auth_tokens()
                 with self._state_lock:
                     self._client = None
-                return self._call_rpc(rpc_id, params, path, timeout, _retry=True)
+                return self._call_rpc(
+                    rpc_id,
+                    params,
+                    path,
+                    timeout,
+                    _retry=True,
+                    retry_server_errors=retry_server_errors,
+                )
             except (ValueError, httpx.HTTPError, OSError) as exc:
                 # A transport or 5xx failure is not evidence that credentials
                 # expired. Retrying auth would produce the wrong user guidance
@@ -1206,7 +1238,15 @@ class BaseClient:
                     logger.debug("CSRF re-extraction after auth recovery failed: %s", exc)
             with self._state_lock:
                 self._client = None
-            return self._call_rpc(rpc_id, params, path, timeout, _retry=True, _deep_retry=True)
+            return self._call_rpc(
+                rpc_id,
+                params,
+                path,
+                timeout,
+                _retry=True,
+                _deep_retry=True,
+                retry_server_errors=retry_server_errors,
+            )
 
         # All recovery attempts failed
         msg = (
@@ -1250,9 +1290,25 @@ class BaseClient:
         with httpx.Client(
             cookies=cookies, headers=headers, follow_redirects=True, timeout=15.0
         ) as client:
+            from notebooklm_tools.utils.config import get_auth_storage_mode, get_profile_dir
+
             from .cookie_rotation import rotate_google_cookies
 
-            rotate_google_cookies(client)
+            prof = getattr(self, "_profile_name", None)
+            cred_path = None
+            if prof:
+                try:
+                    if get_auth_storage_mode(prof) == "protected":
+                        cred_path = get_profile_dir(prof, create=False) / "credentials.enc"
+                    else:
+                        cred_path = get_profile_dir(prof, create=False) / "cookies.json"
+                except Exception:
+                    cred_path = None
+
+            if cred_path is not None:
+                rotate_google_cookies(client, storage_path=cred_path)
+            else:
+                rotate_google_cookies(client)
             home_path = f"{self._get_enterprise_prefix()}/" if self._is_enterprise() else "/"
             response = client.get(f"{self._get_base_url()}{home_path}")
 
@@ -1267,8 +1323,7 @@ class BaseClient:
 
             html = response.text
 
-            # Extract CSRF token — try multiple known key names in case Google changes
-            # the primary key (SNlM0e). Falls back to 'at=' and 'FdrFJe' patterns.
+            # Extract the CSRF token from SNlM0e; session IDs are not CSRF tokens.
             from .auth import extract_csrf_from_page_source
 
             csrf_token = extract_csrf_from_page_source(html)
@@ -1321,31 +1376,83 @@ class BaseClient:
         This avoids re-fetching the NotebookLM page on every client initialization,
         significantly improving performance for subsequent API calls.
         """
+        if self._is_env_auth:
+            return
+
+        from .credential_store import CredentialStoreError, StaleRevisionError
+
         try:
+            import json
             import time
 
-            from .auth import AuthTokens, load_cached_tokens, save_tokens_to_cache
+            from notebooklm_tools.utils.config import get_config, get_profile_dir
 
-            # Load existing cache or create new
-            cached = load_cached_tokens(profile_name=self._profile_name)
-            if cached:
-                # Update existing cache with new tokens
-                cached.cookies = self.cookies
-                cached.csrf_token = self.csrf_token
-                cached.session_id = self._session_id
-                if self._bl:
-                    cached.build_label = self._bl
+            from .auth import AuthTokens, save_tokens_to_cache
+
+            # Merge stored build_label and base_host from metadata.json (non-secret in both modes,
+            # no keystore reads) so an empty client _bl or _base_host never overwrites disk values.
+            prof = self._profile_name or get_config().auth.default_profile
+            stored_bl = ""
+            stored_host = ""
+            meta_path = get_profile_dir(prof, create=False) / "metadata.json"
+            if meta_path.exists():
+                with contextlib.suppress(Exception):
+                    meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if isinstance(meta_data, dict):
+                        stored_bl = meta_data.get("build_label") or ""
+                        stored_host = meta_data.get("base_host") or ""
+
+            final_bl = self._bl or stored_bl
+            final_host = self._base_host or stored_host
+            if not self._bl and stored_bl:
+                self._bl = stored_bl
+            if not self._base_host and stored_host:
+                self._base_host = stored_host
+
+            cached = AuthTokens(
+                cookies=self.cookies,
+                csrf_token=self.csrf_token,
+                session_id=self._session_id,
+                build_label=final_bl,
+                base_host=final_host,
+                extracted_at=time.time(),
+            )
+
+            new_rev = save_tokens_to_cache(
+                cached,
+                silent=True,
+                profile_name=self._profile_name,
+                expected_revision=self._auth_revision,
+                force=False,
+            )
+            if new_rev:
+                self._auth_revision = new_rev
+        except StaleRevisionError:
+            # Another process updated credentials on disk.
+            # Reload newer credentials from disk outside _client_lock and profile lock.
+            logger.info(
+                f"Disk credentials changed for profile '{self._profile_name}'; reloading newer tokens."
+            )
+            from .auth import load_cached_tokens
+
+            reloaded = load_cached_tokens(profile_name=self._profile_name)
+            if reloaded:
+                with self._state_lock:
+                    self.cookies = reloaded.cookies
+                    self.csrf_token = reloaded.csrf_token
+                    self._session_id = reloaded.session_id
+                    if reloaded.build_label:
+                        self._bl = reloaded.build_label
+                    if reloaded.base_host:
+                        self._base_host = reloaded.base_host
+                    self._auth_revision = reloaded.revision
             else:
-                # Create new cache entry
-                cached = AuthTokens(
-                    cookies=self.cookies,
-                    csrf_token=self.csrf_token,
-                    session_id=self._session_id,
-                    build_label=self._bl,
-                    extracted_at=time.time(),
+                logger.warning(
+                    f"Profile '{self._profile_name}' credentials changed on disk but could not be reloaded "
+                    "(profile may have been deleted or renamed)."
                 )
-
-            save_tokens_to_cache(cached, silent=True, profile_name=self._profile_name)
+        except CredentialStoreError:
+            raise
         except Exception as e:
             # Non-critical: caching is an optimization, but log at debug level
             logger.debug(f"Failed to update auth token cache: {e}")
@@ -1355,40 +1462,75 @@ class BaseClient:
 
         Returns True if new valid tokens were obtained, False otherwise.
         """
-        from .auth import load_cached_tokens
+        if self._is_env_auth:
+            return False
 
-        # Layer 2: Reload cookies from the same profile on disk — but only when
-        # those cookies actually differ from the known-bad ones already in
-        # memory (e.g. the user ran `nlm login` in another terminal). Reloading
-        # identical cookies cannot fix the auth failure, and returning True here
-        # regardless is what kept Layer 3 (headless refresh) from ever running
-        # (issue #316). The configured default may also fall back to legacy
-        # auth.json for compatibility.
+        from .auth import load_cached_tokens
+        from .credential_store import StaleRevisionError
+
+        # Capture revision when recovery starts
+        starting_rev = self._auth_revision
+
+        # Layer 2: Reload cookies from the same profile on disk first
         cached = load_cached_tokens(profile_name=self._profile_name)
-        if cached and cached.cookies and cached.cookies != self.cookies:
-            with self._state_lock:
-                self.cookies = cached.cookies
-                self.csrf_token = ""  # Force re-extraction of CSRF token
-                self._session_id = ""  # Force re-extraction of session ID
-            return True
+        if cached:
+            starting_rev = cached.revision
+            if cached.cookies and cached.cookies != self.cookies:
+                with self._state_lock:
+                    self.cookies = cached.cookies
+                    self.csrf_token = ""  # Force re-extraction of CSRF token
+                    self._session_id = ""  # Force re-extraction of session ID
+                    self._auth_revision = cached.revision
+                return True
 
         # Layer 3: Headless auth for the same profile that owns this client.
-        # Relaunching Chrome with the saved profile makes Google reissue the
-        # short-lived *PSIDTS freshness cookies, which is what revives an
-        # otherwise-valid session that aged out (issue #316).
-        try:
-            from notebooklm_tools.utils.auth_browser import run_headless_auth
-            from notebooklm_tools.utils.config import get_config
+        if os.environ.get("NOTEBOOKLM_DISABLE_HEADLESS_REFRESH") == "1":
+            logger.debug("Headless refresh disabled via NOTEBOOKLM_DISABLE_HEADLESS_REFRESH")
+            return False
+        from notebooklm_tools.utils.config import get_config
 
-            profile_name = self._profile_name or get_config().auth.default_profile
-            tokens = run_headless_auth(profile_name=profile_name)
-            if tokens:
-                with self._state_lock:
-                    self.cookies = tokens.cookies
-                    self.csrf_token = tokens.csrf_token
-                    self._session_id = tokens.session_id
-                return True
-        except Exception as e:
-            logger.debug(f"Headless auth failed: {e}")
+        from .auth_recovery_budget import run_automatic_recovery
 
-        return False
+        profile_name = self._profile_name or get_config().auth.default_profile
+
+        def recover():
+            try:
+                from notebooklm_tools.utils.auth_browser import run_headless_auth
+
+                return run_headless_auth(
+                    profile_name=profile_name,
+                    expected_revision=starting_rev,
+                    force=False,
+                )
+            except StaleRevisionError:
+                # Keep credentials saved by a concurrent external login.
+                logger.info(
+                    "Disk credentials changed during headless auth; keeping disk credentials."
+                )
+                return load_cached_tokens(profile_name=profile_name)
+            except Exception as e:
+                logger.debug(f"Headless auth failed: {e}")
+                return None
+
+        budget_revision = starting_rev
+        if budget_revision is None:
+            # File-mode profiles have no envelope revision. A cookie change
+            # from an external login must still reset the recovery budget.
+            cookie_snapshot = cached.cookies if cached else self.cookies
+            budget_revision = hashlib.sha256(
+                json.dumps(cookie_snapshot, sort_keys=True).encode()
+            ).hexdigest()
+        tokens = run_automatic_recovery(profile_name, budget_revision, recover)
+        if not tokens:
+            logger.info("Automatic headless auth failed or deferred by per-profile recovery budget")
+            return False
+        with self._state_lock:
+            self.cookies = tokens.cookies
+            self.csrf_token = tokens.csrf_token
+            self._session_id = tokens.session_id
+            if tokens.build_label:
+                self._bl = tokens.build_label
+            if tokens.base_host:
+                self._base_host = tokens.base_host
+            self._auth_revision = getattr(tokens, "revision", None)
+        return True

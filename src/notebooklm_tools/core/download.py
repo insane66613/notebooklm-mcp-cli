@@ -5,7 +5,9 @@ import asyncio
 import csv
 import html as html_module
 import json
+import os
 import re
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,17 @@ from .errors import (
 from .errors import (
     ClientAuthenticationError as AuthenticationError,
 )
+from .studio import render_interactive_report_markdown
 from .utils import is_mind_map_json
+
+
+def _create_download_temp_path(output_file: Path) -> Path:
+    """Reserve a unique same-directory temp file for one download transfer."""
+    # Not tempfile.mkstemp: it forces 0600, which the final file would inherit.
+    # O_EXCL still guarantees a unique file; 0o666 lets the umask decide the mode.
+    temp_path = output_file.parent / f".nlm-download-{uuid.uuid4().hex}.tmp"
+    os.close(os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+    return temp_path
 
 
 class DownloadMixin(BaseClient):
@@ -42,6 +54,9 @@ class DownloadMixin(BaseClient):
     """
 
     _AUDIO_DOWNLOAD_RETRY_DELAYS = (5, 10, 20, 30, 45, 60, 60)
+    # Keep video retries brief; MCP's optional wait loop can keep polling after
+    # these attempts, while a one-shot CLI download stays responsive.
+    _VIDEO_DOWNLOAD_RETRY_DELAYS = (5, 10, 20)
     _GOOGLE_MEDIA_DOWNLOAD_HOSTS = {
         "drum.usercontent.google.com",
         "lh3.googleusercontent.com",
@@ -106,6 +121,20 @@ class DownloadMixin(BaseClient):
             and final_url.path.startswith("/rd-notebooklm/")
         )
 
+    def _is_transient_video_media_404(self, url: str, error: ArtifactDownloadError) -> bool:
+        cause = error.__cause__
+        if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code != 404:
+            return False
+
+        original = urlparse(url)
+        final = urlparse(str(cause.response.url))
+        return (
+            original.hostname in self._GOOGLE_MEDIA_DOWNLOAD_HOSTS
+            and original.path.startswith("/notebooklm/")
+            and final.hostname in self._GOOGLE_MEDIA_DOWNLOAD_HOSTS
+            and final.path.startswith(("/notebooklm/", "/rd-notebooklm/"))
+        )
+
     async def _download_url(
         self,
         url: str,
@@ -137,9 +166,6 @@ class DownloadMixin(BaseClient):
         """
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use temp file to prevent corrupted partial downloads
-        temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
 
         # Build headers with auth cookies
         base_headers = getattr(
@@ -175,6 +201,7 @@ class DownloadMixin(BaseClient):
         # Per-chunk timeouts: 10s connect, 30s per chunk read/write
         # This allows large files to download without timeout while detecting stalls
         timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+        temp_file = _create_download_temp_path(output_file)
 
         try:
             async with (
@@ -234,7 +261,7 @@ class DownloadMixin(BaseClient):
                                 progress_callback(bytes_downloaded, total_bytes)
 
             # Move temp file to final location only on success
-            temp_file.rename(output_file)
+            os.replace(temp_file, output_file)
             return str(output_file)
 
         except httpx.HTTPError as e:
@@ -251,12 +278,14 @@ class DownloadMixin(BaseClient):
             raise ArtifactDownloadError(
                 "file", details=f"Failed to download from {url[:50]}...: {str(e)}"
             ) from e
+        finally:
+            # Also covers cancellation/Ctrl-C, which skip the except blocks above.
+            temp_file.unlink(missing_ok=True)
 
     def _download_url_sync(self, url: str, output_path: str) -> str:
         """Stream a binary artifact URL synchronously to a local file."""
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
 
         base_headers = getattr(
             self,
@@ -277,6 +306,7 @@ class DownloadMixin(BaseClient):
             cookies.delete("__Secure-OSID", domain=domain)
 
         timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+        temp_file = _create_download_temp_path(output_file)
         try:
             with (
                 httpx.Client(
@@ -289,7 +319,7 @@ class DownloadMixin(BaseClient):
                     for chunk in response.iter_bytes(chunk_size=65536):
                         output.write(chunk)
 
-            temp_file.rename(output_file)
+            os.replace(temp_file, output_file)
             return str(output_file)
         except httpx.HTTPError as e:
             if temp_file.exists():
@@ -303,6 +333,8 @@ class DownloadMixin(BaseClient):
             raise ArtifactDownloadError(
                 "file", details=f"Failed to download from {url[:50]}...: {e}"
             ) from e
+        finally:
+            temp_file.unlink(missing_ok=True)
 
     def _list_raw(self, notebook_id: str) -> list[Any]:
         """Get raw artifact list for parsing download URLs."""
@@ -442,66 +474,83 @@ class DownloadMixin(BaseClient):
         Returns:
             The output path.
         """
-        artifacts = self._list_raw(notebook_id)
-
-        # Filter for completed video (Type 3, Status 3)
-        candidates = []
-        for a in artifacts:
-            if isinstance(a, list) and len(a) > 4:  # noqa: SIM102
-                if a[2] == self.STUDIO_TYPE_VIDEO and a[4] == 3:
-                    candidates.append(a)
-
-        if not candidates:
-            raise ArtifactNotReadyError("video")
-
-        target = None
-        if artifact_id:
-            target = next((a for a in candidates if a[0] == artifact_id), None)
-            if not target:
-                raise ArtifactNotReadyError("video", artifact_id)
-        else:
-            target = candidates[0]
-
-        # Extract URL from metadata[8]
         try:
-            metadata = target[8]
-            if not isinstance(metadata, list):
-                raise ArtifactParseError("video", details="Invalid metadata structure")
 
-            # First, find the media_list (nested list containing URLs)
-            media_list = None
-            for item in metadata:
-                if (
-                    isinstance(item, list)
-                    and len(item) > 0
-                    and isinstance(item[0], list)
-                    and len(item[0]) > 0
-                    and isinstance(item[0][0], str)
-                    and item[0][0].startswith("http")
-                ):
-                    media_list = item
-                    break
+            def select_url() -> str:
+                artifacts = self._list_raw(notebook_id)
+                candidates = [
+                    a
+                    for a in artifacts
+                    if isinstance(a, list)
+                    and len(a) > 4
+                    and a[2] == self.STUDIO_TYPE_VIDEO
+                    and a[4] == 3
+                ]
+                if not candidates:
+                    raise ArtifactNotReadyError("video")
+                target = (
+                    next((a for a in candidates if a[0] == artifact_id), None)
+                    if artifact_id
+                    else candidates[0]
+                )
+                if target is None:
+                    raise ArtifactNotReadyError("video", artifact_id)
 
-            if not media_list:
-                raise ArtifactDownloadError("video", details="No media URLs found in metadata")
+                metadata = target[8]
+                if not isinstance(metadata, list):
+                    raise ArtifactParseError("video", details="Invalid metadata structure")
 
-            # Look for video/mp4 with optimal encoding (item[1] == 4 indicates priority)
-            url = None
-            for item in media_list:
-                if isinstance(item, list) and len(item) > 2 and item[2] == "video/mp4":
-                    url = item[0]
-                    # Prefer URLs with priority flag (item[1] == 4)
-                    if len(item) > 1 and item[1] == 4:
-                        break
+                media_list = next(
+                    (
+                        item
+                        for item in metadata
+                        if isinstance(item, list)
+                        and item
+                        and isinstance(item[0], list)
+                        and item[0]
+                        and isinstance(item[0][0], str)
+                        and item[0][0].startswith("http")
+                    ),
+                    None,
+                )
+                if not media_list:
+                    raise ArtifactDownloadError("video", details="No media URLs found in metadata")
 
-            # Fallback to first URL if no video/mp4 found
-            if not url and len(media_list) > 0 and isinstance(media_list[0], list):
-                url = media_list[0][0]
+                # Prefer the video/mp4 download variant (priority 4).
+                urls = [
+                    item
+                    for item in media_list
+                    if isinstance(item, list) and len(item) > 2 and item[2] == "video/mp4"
+                ]
+                preferred = next((item for item in urls if len(item) > 1 and item[1] == 4), None)
+                fallback = media_list[0] if isinstance(media_list[0], list) else None
+                selected = preferred or (urls[0] if urls else fallback)
+                url = selected[0] if selected and isinstance(selected[0], str) else None
+                if not url:
+                    raise ArtifactDownloadError("video", details="No download URL found")
+                return url
 
-            if not url:
-                raise ArtifactDownloadError("video", details="No download URL found")
+            url = select_url()
+            for attempt in range(len(self._VIDEO_DOWNLOAD_RETRY_DELAYS) + 1):
+                try:
+                    return await self._download_url(url, output_path, progress_callback)
+                except ArtifactDownloadError as e:
+                    if not self._is_transient_video_media_404(url, e):
+                        raise
+                    if attempt == len(self._VIDEO_DOWNLOAD_RETRY_DELAYS):
+                        raise ArtifactDownloadError(
+                            "video",
+                            details="media download URL is still propagating; retry in a few minutes",
+                        ) from e
+                    delay = self._VIDEO_DOWNLOAD_RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "Video media URL returned 404 while propagating; retrying in %.0fs...",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    url = select_url()
 
-            return await self._download_url(url, output_path, progress_callback)
+            raise ArtifactDownloadError("video", details="No download URL found")
 
         except (IndexError, TypeError, AttributeError) as e:
             raise ArtifactParseError("video", details=str(e)) from e
@@ -661,11 +710,14 @@ class DownloadMixin(BaseClient):
         """
         artifacts = self._list_raw(notebook_id)
 
-        # Filter for completed reports (Type 6, Status 3)
+        # Filter for completed reports (classic type 2 and interactive type 11)
         candidates = []
         for a in artifacts:
             if isinstance(a, list) and len(a) > 7:  # noqa: SIM102
-                if a[2] == self.STUDIO_TYPE_REPORT and a[4] == 3:
+                if (
+                    a[2] in (self.STUDIO_TYPE_REPORT, self.STUDIO_TYPE_INTERACTIVE_REPORT)
+                    and a[4] == 3
+                ):
                     candidates.append(a)
 
         if not candidates:
@@ -680,6 +732,24 @@ class DownloadMixin(BaseClient):
             target = candidates[0]
 
         try:
+            if target[2] == self.STUDIO_TYPE_INTERACTIVE_REPORT:
+                # Interactive reports render from their structured document
+                # (index 34). Prepend the artifact title as a Markdown H1; the
+                # document itself starts at H2 level.
+                markdown_content = render_interactive_report_markdown(target)
+                if not markdown_content:
+                    raise ArtifactParseError(
+                        "report", details="Interactive report has no document yet"
+                    )
+                title = target[1] if len(target) > 1 and isinstance(target[1], str) else ""
+                if title:
+                    markdown_content = f"# {title}\n\n{markdown_content}"
+
+                output = Path(output_path)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(markdown_content, encoding="utf-8")
+                return str(output)
+
             # Report content is in index 7
             content_wrapper = target[7]
             markdown_content = ""
@@ -1273,6 +1343,17 @@ class DownloadMixin(BaseClient):
             raise ArtifactDownloadError(
                 "interactive", details=f"Unexpected API response structure: {e}"
             ) from e
+
+    def get_interactive_app_data(self, notebook_id: str, artifact_id: str) -> dict[str, Any] | None:
+        """Return the structured app data of a quiz, flashcard deck or mind map.
+
+        Reuses the download path's HTML fetch and ``data-app-data`` extraction
+        so review content matches what ``download_artifact`` saves.
+        """
+        html_content = self._get_artifact_content(notebook_id, artifact_id)
+        if not html_content:
+            return None
+        return self._extract_app_data(html_content)
 
     def _extract_app_data(self, html_content: str) -> dict:
         """Extract JSON app data from interactive HTML.

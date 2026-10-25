@@ -1,11 +1,11 @@
 # Gemini Notebook (formerly Google NotebookLM) MCP - Comprehensive Test Plan
 
-**Purpose:** Verify all **43 MCP tools** work correctly.
+**Purpose:** Verify all **53 MCP tools** work correctly.
 
-**Version:** 2.6 (Updated 2026-08-03 - synchronized current MCP surface)
+**Version:** 2.7 (Updated 2026-09-27 - synchronized current MCP surface)
 
-**Changes from v2.4:**
-- Current tool count: 43 tools — added `chat_list`, `chat_get`, `chat_export` (list/view/export notebook chat sessions)
+**Changes from v2.6:**
+- Current tool count: 53 tools — adds `profile`, `alias` and `chat_save_to_note`, plus `pipeline` create and profile info in `server_info` (v0.15.0).
 
 **Historical changes from v2.1:**
 - The test plan previously covered 39 tools, including consolidated notes, labels, async query, batch, pipeline, tags, and server_info.
@@ -72,6 +72,46 @@ environment (that value overrides saved credentials).
 
 ---
 
+### Test 1.1c - Credential Storage Management (Protected Mode)
+**CLI:** `nlm auth storage status`, `nlm auth storage set protected`, `nlm auth storage set file`
+
+**Prompt:**
+```
+Check my NotebookLM credential storage mode and test switching between file mode and protected mode.
+```
+
+**Expected:**
+1. `nlm auth storage status`: Shows profile name, storage mode (`file` or `protected`), and presence of ciphertext or legacy files.
+2. `nlm auth storage set protected`: Encrypts credentials to `credentials.enc` using the OS keystore (macOS Keychain, Windows Credential Manager, Linux SecretService) and removes plaintext files.
+3. `nlm auth storage set file`: Decrypts credentials back to `cookies.json` with 0600 permissions.
+
+---
+
+### Test 1.1d - Profiles (`profile` tool)
+**Tool:** `profile` (action: list, status, switch)
+
+**Prompt:**
+```
+List my Gemini Notebook profiles, switch to my other profile for this session, then tell me how many notebooks I have. Do not change my default.
+```
+
+**Expected:**
+1. `profile(action="list")` returns every saved profile with email, `storage_mode`, `is_saved_default`, `is_active`.
+2. `profile(action="switch", name=...)` returns `scope: "session"`; later tools use that account and results carry `active_profile_note`.
+3. The saved default (`nlm config get auth.default_profile`) is unchanged.
+4. Quitting and reopening the app returns to the saved default.
+5. `make_default=true` changes `default_profile` in `~/.notebooklm-mcp-cli/config.toml` (switch it back afterwards).
+6. With `NOTEBOOKLM_COOKIES` set in the server's environment, switching returns an error.
+
+---
+
+### Test 1.1e - Aliases, chat-to-note, pipeline create
+**Tools:** `alias`, `chat_save_to_note`, `pipeline` (action: create)
+
+**Expected:** `alias(action="set", name="nb", value="<notebook id>")` then `notebook_get(notebook_id="nb")` resolves the alias; `chat_save_to_note` creates a note from a chat; `pipeline(action="create", ...)` saves a pipeline that `pipeline(action="list")` shows.
+
+---
+
 ### Test 1.2 - Interactive Login (Primary)
 **Tool:** `save_auth_tokens` (Fallback)
 **CLI:** `nlm login` (Launches Chrome for automated extraction)
@@ -84,6 +124,17 @@ I need to authenticate with NotebookLM.
 
 **Expected:** Chrome opens, logs in, and tokens are saved. On WSL2, Windows Chrome opens and
 the CDP connection succeeds in both NAT and mirrored networking modes.
+
+**Anonymous-session regression (#350):**
+1. Run login with a new profile. Before signing in, the browser must remain open;
+   a public landing page, build label, or anonymous `NID` cookie must not finish login.
+2. Complete Google sign-in. Login saves signed-in cookies and a CSRF token, then
+   closes the browser it launched. Verify the profile with `nlm login --check`.
+3. If sign-in times out, login fails without saving anonymous credentials.
+4. For a profile previously saved with only `NID`, rerunning login opens the
+   sign-in browser. `--check` must not report success based on a public HTTP 200 page.
+5. An API authentication rejection must fail validation; a genuine network timeout
+   remains inconclusive and must not be mislabeled as credential expiry.
 
 ---
 
@@ -243,6 +294,13 @@ List all sources in notebook [notebook_id] and check their Drive freshness statu
 **Large notebook variant:** Call `source_list_drive` with `skip_freshness=True`, or use
 `nlm source list [notebook_id] --drive --skip-freshness`. Expected: sources are listed
 without per-source freshness checks; stale status may be unknown.
+
+**Drive-picker file variant:** Include a PDF, text, Markdown, Word, or PowerPoint file
+that was imported from Google Drive. Expected: type-14 files with Drive metadata appear
+in `drive_sources` with their Drive IDs and `can_sync: true`; directly uploaded type-14
+files without that metadata remain in `other_sources`. `can_sync` marks eligibility to
+attempt a manual sync, not a guarantee that every source's RPC will succeed. Only
+manually sync entries the tool marks `can_sync: true`.
 
 **Save:** Note a `source_id` for next tests.
 
@@ -515,6 +573,128 @@ Create a report for notebook [notebook_id]:
 ```
 
 **Expected:** Report generation started.
+
+---
+
+### Test 5.3b - Create Interactive Report
+**Tool:** `studio_create`
+**CLI:** `nlm report create [notebook_id] --format Interactive --template learning_overview --prompt "Summarize the key ideas with a quiz" --confirm`
+
+**Prompt:**
+```
+Create an interactive report for notebook [notebook_id]:
+- artifact_type: report
+- report_format: Interactive
+- report_template: learning_overview
+- custom_prompt: Summarize the key ideas with a quiz
+- confirm: True
+```
+
+**Expected:** Interactive report generation starts (status "queued" -> "in_progress"
+-> "completed" in `studio_status`). The artifact type shows as `interactive_report`.
+
+---
+
+### Test 5.3c - Read Interactive Report
+**Tool:** `report` (action=get)
+**CLI:** `nlm report get [notebook_id] [artifact_id]` (or `--json`, `--output report.md`)
+
+**Prompt:**
+```
+Read interactive report [artifact_id] in notebook [notebook_id]:
+- call report(action="get")
+- show the first section of the markdown and the element list
+```
+
+**Expected:** Markdown content, prompt and the embedded elements
+(mind map / infographic / flashcards / slide deck / quiz) with status
+"suggested" before they are generated.
+
+---
+
+### Test 5.3d - List and Generate Report Elements
+**Tool:** `report` (action=elements, generate)
+**CLI:** `nlm report elements [notebook_id] [artifact_id]` then
+`nlm report element create [notebook_id] [artifact_id] --type quiz --confirm`
+
+**Prompt:**
+```
+List the embedded elements of interactive report [artifact_id], then generate
+the quiz element.
+```
+
+**Expected:** Element list shows ids/types/statuses; generating one flips its
+status from "suggested" to generation states and the element also appears in the
+notebook Studio panel.
+
+---
+
+### Test 5.3e - Report Element Settings Sweep
+**Tool:** `report` (action=generate, one-item plan)
+**CLI:** `nlm report element create [notebook_id] [artifact_id] --type quiz --setting difficulty=hard --setting question_amount=more --confirm`
+
+**Prompt:**
+```
+Generate an interactive report quiz element with settings difficulty=hard and question_amount=more.
+```
+
+**Expected:** Generation starts with custom settings passed into generation options (`difficulty=3`, `question_amount=3`).
+
+---
+
+### Test 5.3f - Batch Element Plan Validation (Invalid Item Stops All)
+**Tool:** `report` (action=generate)
+**CLI:** `nlm report element create-batch [notebook_id] [artifact_id] --plan invalid_plan.json --confirm`
+
+**Prompt:**
+```
+Validate and attempt to run a batch plan containing 2 valid element IDs and 1 non-existent or invalid element ID:
+[
+  {"element_id": "valid-id-1"},
+  {"element_id": "invalid-id-xyz"}
+]
+```
+
+**Expected:** Validation fails before any RPC mutation occurs; no elements change status or start generation.
+
+---
+
+### Test 5.3g - Batch Generation Stops on Quota Exhaustion
+**Tool:** `report` (action=generate)
+**CLI:** `nlm report element create-batch [notebook_id] [artifact_id] --plan plan.json --confirm`
+
+**Prompt:**
+```
+Run a multi-element batch plan when quota is exhausted.
+```
+
+**Expected:** Generation terminates immediately when encountering `RESOURCE_EXHAUSTED`; result reports `stopped_reason="quota"` and remaining planned items stay `not_started`.
+
+---
+
+### Test 5.3h - Element Bounded Waiting and Timeout
+**Tool:** `report` (action=elements)
+**CLI:** `nlm report elements [notebook_id] [artifact_id] --wait [element_id] --timeout 10`
+
+**Prompt:**
+```
+Wait on an in-progress element for up to 10 seconds.
+```
+
+**Expected:** Returns status before timeout if completed/failed, or returns `timed_out: true` with current status if timeout elapses without raising an error.
+
+---
+
+### Test 5.3i - Inline Content for Element Review
+**Tool:** `report` (action=elements)
+**CLI:** `nlm report elements [notebook_id] [artifact_id] --content`
+
+**Prompt:**
+```
+List report elements with include_content=True to review completed quiz, flashcard, or mind map elements.
+```
+
+**Expected:** Returns inline structured content for review with label "Checked against the plan and the report section, not against the original sources."
 
 ---
 
@@ -1061,6 +1241,91 @@ How much of my Gemini Notebook usage allowance is left?
 - `percent_used` and `percent_remaining` sum to 100 for a partly consumed window.
 - With an expired session it reports an authentication error and hints at
   `nlm auth refresh`. It must NOT report the allowance as exhausted.
+
+### Test 13.2 - Check Work and Personal Profiles
+**Tool:** `usage_get(profile="work")`, then `usage_get(profile="personal")`
+**CLI:** `nlm usage --profile work`, then `nlm usage -p personal --json`
+
+**Expected:**
+- Each call reads the selected saved account's usage, even when
+  `NOTEBOOKLM_COOKIES` is set for a different account.
+- The configured default and the account used by other MCP tools are unchanged.
+- Missing profiles return an error without falling back to environment cookies
+  or the default account.
+- Omitting the profile keeps the existing environment/default authentication.
+
+---
+
+## Test Group 14: Setup Wizard (CLI only)
+
+Automated: `uv run pytest -m wizard_e2e` drives the real `nlm setup` in a
+pseudo-terminal against a sandboxed HOME (fake `claude`/`codex`/`ps`/`pbcopy`/
+`open`) and checks the files written. Run it after any change to
+`cli/commands/setup.py`, `setup_wizard.py`, `skill.py` or `cli/skill_package.py`.
+The manual checks below cover what the sandbox can't: the real `claude` and
+`codex` CLIs, and the real Claude Desktop upload. Run `nlm setup` in a real
+terminal (not an agent's shell — it refuses non-interactive sessions).
+
+### Test 14.1 - Status and Esc
+**CLI:** `nlm setup` → **Show my tools' status**
+
+**Expected:**
+- Only installed tools are listed, with ✓ set up / ✗ not yet / ⚠ old name and
+  the skill version (⬆ when an upgrade exists).
+- Esc on every screen returns to the main menu within ~0.1s; Esc on the main
+  menu quits.
+
+### Test 14.2 - Connect and rename
+**CLI:** `nlm setup` → **Add the MCP to my tools/agents**
+
+**Expected:**
+- Nothing is pre-ticked; already-connected tools are shown but not selectable.
+- Tools whose entry is still `notebooklm-mcp` appear under **Needs a fix**;
+  ticking them reports `repaired · Renamed to gemini-notebook-mcp`.
+- Verify: `claude mcp list` shows `gemini-notebook-mcp ✔ Connected`;
+  `~/.codex/config.toml` has `[mcp_servers.gemini-notebook-mcp]` and kept any
+  extra keys (e.g. `enabled = true`); Claude Desktop configs (both profiles if
+  chosen) contain `gemini-notebook-mcp` with the full binary path.
+- With Claude Desktop open, connecting it is refused ("still running").
+
+### Test 14.3 - Skill and Claude Desktop upload file
+**CLI:** `nlm setup` → **Add the skill to my tools/agents** (or `nlm skill package`)
+
+**Expected:**
+- No "Add the skill?" question — it opens on "Where should the skill live?".
+- The picker includes **Claude Desktop / claude.ai · creates a file to upload**,
+  not pre-ticked. Ticking it saves `~/Downloads/nlm-skill.zip`, reveals it in
+  Finder, and shows the upload steps last.
+- Upload via Claude Desktop **Customize → Skills → Add**: accepted; the skill
+  appears on the Skills page and loads in Chat and Cowork.
+
+### Test 14.4 - Remove and copy setup
+**CLI:** `nlm setup` → **Remove an MCP or skill**, then **Copy MCP setup for a tool not listed**
+
+**Expected:**
+- Remove: grouped MCP connections / Skills, nothing pre-ticked, two separate
+  default-No confirmations; only ticked items change; backups appear in
+  `~/.notebooklm-mcp-cli/backups/`.
+- Copy: the clipboard holds `{"mcpServers": {"gemini-notebook-mcp": {"command": "<full path>/notebooklm-mcp"}}}`.
+
+### Test 14.5 - Credential protection
+**CLI:** `nlm setup` → **Credential protection**
+
+**Expected:**
+- With no saved logins: "No saved logins yet. Run 'nlm login' first."
+- With plain logins: lists each as `plain` and offers **Protect saved logins (recommended)**; with several logins a checkbox picker appears.
+- With protected logins: offers **Restore protected logins to plain files** (asks to confirm, default No); never offers Protect for an already-protected login.
+- Mixed: offers both.
+- Afterwards `nlm auth storage status` matches, and no protection tip appears for a protected login.
+
+### Test 14.6 - First login on a new profile (new-user flow)
+**CLI:** `nlm login` on a machine (or sandbox) with no saved logins
+
+**Expected:**
+1. Before the browser opens: "Where should your saved login live?" with Protected (recommended) and Plain file.
+2. Choosing 1 stores the login encrypted (`credentials.enc`, no `cookies.json`) and ends with "✓ Login stored in protected mode." with no further tips or questions.
+3. A profile name protected mode can't use (`my work`, `john@work.com`) offers a working name (`my-work`) or keeping the name as a plain file.
+4. Ctrl+C or closing the flow leaves no profile folder, no saved answer, and closes the Chrome window it opened.
 
 ---
 
