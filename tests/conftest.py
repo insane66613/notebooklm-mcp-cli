@@ -7,6 +7,17 @@ import pytest
 from notebooklm_tools.core.cookie_rotation import DISABLE_ROTATE_COOKIES_ENV
 
 
+def pytest_collection_modifyitems(config, items):
+    """Skip live integration tests unless explicitly enabled."""
+    if os.environ.get("NOTEBOOKLM_E2E") == "1":
+        return
+
+    skip_e2e = pytest.mark.skip(reason="requires NOTEBOOKLM_E2E=1")
+    for item in items:
+        if item.get_closest_marker("e2e"):
+            item.add_marker(skip_e2e)
+
+
 def _is_allowed_live_modification(rel_path: str) -> bool:
     """Check if a modified file in ~/.notebooklm-mcp-cli is on the live-written allowlist."""
     norm = rel_path.replace("\\", "/")
@@ -201,6 +212,8 @@ def _isolate_storage(monkeypatch, tmp_path, request):
     Explicitly enabled E2E tests use the real authenticated profile,
     but NLM_AUTH_STORAGE is forced to 'file' to guarantee no migration,
     deletion, or protected-mode code paths can ever run during E2E.
+    Normal tests also disable legacy profile and auth source migration
+    before resetting the config cache.
     """
     from notebooklm_tools.utils.config import reset_config
 
@@ -214,7 +227,13 @@ def _isolate_storage(monkeypatch, tmp_path, request):
         return
 
     from notebooklm_tools.mcp.tools._utils import reset_mcp_probe_state
+    from notebooklm_tools.utils import config as config_module
 
+    # An empty test directory must never import authentication or profiles
+    # from legacy locations on the developer's actual computer.
+    monkeypatch.setattr(config_module, "get_old_chrome_profiles", lambda: [])
+    monkeypatch.setattr(config_module, "get_old_auth_locations", lambda: [])
+    monkeypatch.setattr(config_module, "OLD_ALIAS_LOCATIONS", [])
     reset_mcp_probe_state()
     monkeypatch.setenv("NOTEBOOKLM_MCP_CLI_PATH", str(tmp_path / "storage"))
     reset_config()
